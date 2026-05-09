@@ -1,0 +1,73 @@
+# Build the wasm crate and deploy the resulting `dist/` to GitHub Pages.
+#
+# Pipeline:
+#   1. Compile crates/app to wasm32-unknown-unknown.
+#   2. Run wasm-bindgen-cli (pinned to whatever version Cargo.lock resolved
+#      for the wasm-bindgen crate — they have to match exactly).
+#   3. The build script also copies index.html + the heightmap/water-mask PNGs
+#      from crates/app/assets into dist/.
+#   4. Upload dist/ as the Pages artifact and deploy.
+name: Deploy static content to Pages
+
+on:
+  push:
+    branches: ["master"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      # wasm-bindgen-cli's version MUST match the wasm-bindgen crate version.
+      # Cargo.lock is the source of truth; pull it out so we can pass it to
+      # taiki-e/install-action (which downloads a prebuilt binary in seconds
+      # rather than `cargo install`-ing for several minutes).
+      - name: Detect wasm-bindgen version from Cargo.lock
+        id: wb
+        run: |
+          ver=$(grep -A 1 '^name = "wasm-bindgen"$' Cargo.lock | grep '^version' | head -1 | sed -E 's/version = "(.*)"/\1/')
+          echo "Detected wasm-bindgen ${ver}"
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+
+      - name: Install wasm-bindgen-cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@${{ steps.wb.outputs.version }}
+
+      - name: Build wasm + assemble dist/
+        run: ./script/build-wasm
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

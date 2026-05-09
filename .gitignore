@@ -1,6 +1,7 @@
 /target
-# `dist/` is intentionally tracked: the built wasm + assets are committed and
-# served straight to GitHub Pages.
+# `dist/` is built fresh on every CI run by .github/workflows/static.yml, so
+# we ignore it locally and don't track it in git.
+/dist
 
 # OS / tool junk.
 .DS_Store
