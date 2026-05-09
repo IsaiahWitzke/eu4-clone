@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Build the eu4-app crate to wasm and produce a deployable dist/ folder.
+#
+# Outputs:
+#   dist/index.html
+#   dist/app.js          (wasm-bindgen JS glue)
+#   dist/app_bg.wasm     (post-processed wasm)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROFILE="${PROFILE:-release}"
+
+cd "$ROOT"
+
+# 1. Compile the binary crate to wasm.
+cargo build --target wasm32-unknown-unknown --profile "$PROFILE" -p eu4-app
+
+# 2. Run wasm-bindgen on the resulting .wasm file.
+WASM_INPUT="target/wasm32-unknown-unknown/${PROFILE}/eu4_app.wasm"
+wasm-bindgen \
+  --target web \
+  --out-dir dist \
+  --out-name app \
+  --no-typescript \
+  "$WASM_INPUT"
+
+# 3. Copy the hand-written HTML into dist/.
+cp web/index.html dist/index.html
+
+# 4. Copy runtime assets (heightmap, water mask) into dist/. They're served
+#    directly by the local server and fetched by the wasm at startup, so the
+#    wasm bundle stays small.
+if [ -d "$ROOT/crates/app/assets" ]; then
+  shopt -s nullglob
+  for asset in "$ROOT/crates/app/assets"/*.png; do
+    cp "$asset" "$ROOT/dist/$(basename "$asset")"
+  done
+fi
+
+echo "built dist/ from $WASM_INPUT"

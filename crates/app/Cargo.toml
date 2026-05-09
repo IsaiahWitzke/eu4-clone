@@ -1,0 +1,35 @@
+[package]
+name = "eu4-app"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+eu4-math = { path = "../math" }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+# `webgl` is a wasm32-only feature that compiles in the WebGL2 backend (wgpu-core +
+# wgpu-hal/gles). The default `gles` feature only applies to native Linux/Windows/Android/
+# Emscripten, NOT browser wasm — a footgun.
+wgpu = { version = "29", features = ["webgl"] }
+bytemuck = { version = "1", features = ["derive"] }
+png = "0.17"
+# Avoid the heavyweight `image` crate — we only need to decode our own PNG
+# heightmap + water mask. `png` is a tiny pure-rust decoder.
+web-sys = { version = "0.3", features = [
+    "console",
+    "Window",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "KeyboardEvent",
+    "MouseEvent",
+    # Required for fetching assets at runtime.
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+] }

@@ -1,0 +1,16 @@
+/target
+/dist
+
+# OS / tool junk.
+.DS_Store
+*.aux.xml
+
+# Asset generation intermediates. The final, committed assets are
+# `crates/app/assets/heightmap.png` and `crates/app/assets/water_mask.png`;
+# everything else (raw tiles, reprojection products, preview renders) is
+# regeneratable.
+/crates/app/assets/tiles/
+/crates/app/assets/natural_earth/
+/crates/app/assets/swiss.vrt
+/crates/app/assets/water_mask.tif
+/crates/app/assets/preview.png
