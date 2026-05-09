@@ -1,5 +1,6 @@
 /target
-/dist
+# `dist/` is intentionally tracked: the built wasm + assets are committed and
+# served straight to GitHub Pages.
 
 # OS / tool junk.
 .DS_Store

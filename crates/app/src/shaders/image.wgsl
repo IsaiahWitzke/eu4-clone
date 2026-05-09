@@ -2,16 +2,18 @@
 // Image pass: raymarched terrain rendering. Renders to the swapchain.
 //
 // Reads:
-//   u            (binding 0)  — camera uniforms (from camera.wgsl)
+//   u              (binding 0) — camera uniforms (from camera.wgsl)
 //   base_heightmap (binding 1) — world-anchored painted heightmap
 //   detail_noise   (binding 2) — world-anchored detail noise
 //   terrain        (binding 3) — world-anchored eroded heightmap (the terrain)
-//   layer        (binding 4)  — world AABB covered by the three layers above
+//   layer          (binding 4) — world AABB covered by the three layers above
+//   water_mask     (binding 5) — binary mask, 1.0 where water, 0.0 elsewhere
 // ============================================================================
 @group(0) @binding(1) var base_heightmap: texture_2d<f32>;
 @group(0) @binding(2) var detail_noise: texture_2d<f32>;
 @group(0) @binding(3) var terrain: texture_2d<f32>;
 @group(0) @binding(4) var<uniform> layer: LayerUniforms;
+@group(0) @binding(5) var water_mask: texture_2d<f32>;
 
 // ----------------------------------------------------------------------------
 // Constants
@@ -41,9 +43,11 @@ const WATER_SHORE_COLOR = vec3<f32>(0.00, 0.25, 0.25);
 const SUN_COLOR         = vec3<f32>(2.0, 1.96, 1.90);
 const AMBIENT_COLOR     = vec3<f32>(0.03, 0.05, 0.07);
 
-// Heights / quality.
-const WATER_HEIGHT:    f32 = 0.46;
-const GRASS_HEIGHT:    f32 = 0.465;
+// Heights / quality. Heights are fractions of HEIGHT_SCALE_M (= 5000 m), so
+// y = 0 is sea level, y = 1 is the highest representable peak. Lake Maggiore
+// (Switzerland's lowest body of water) sits at ~190 m → 0.038.
+const WATER_HEIGHT:    f32 = 0.038;
+const GRASS_HEIGHT:    f32 = 0.045;
 const RAYMARCH_QUALITY: f32 = 2.0;
 
 // Atmosphere coefficients (Rayleigh + Mie).
@@ -293,8 +297,10 @@ fn march(ro: vec3<f32>, rd: vec3<f32>) -> MarchResult {
         s_t = max(0.0, min(s_t, altitude / t));
 
         if (altitude < 0.0 && i < 1) {
-            // Hit a side wall of the bounding box on first sample.
-            if (pos.y < 0.35) {
+            // Hit a side wall of the bounding box on first sample. Below sea
+            // level (y < 0) we escape to sky; otherwise it's an exposed cliff
+            // (strata material).
+            if (pos.y < 0.0) {
                 return MarchResult(-1.0, vec3<f32>(0.0), M_GROUND, 9999.0);
             }
             normal = box.normal;
@@ -366,9 +372,29 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     } else {
         let pos = ro + rd * m.t;
         var normal = m.normal;
+        var material = m.material;
 
-        if (m.material == M_GROUND) {
+        if (material == M_GROUND) {
             normal = map_full(world_xz_to_uv(pos)).yzw;
+        }
+
+        // Water-mask override: if the real Switzerland water mask says this
+        // XZ is water, classify the hit as water regardless of what the
+        // box-intersection-based march decided. Skip strata cliffs since
+        // those are exposed rock walls (not on the surface).
+        if (material != M_STRATA) {
+            let mask_size_i = i32(WORLD_HEIGHTMAP_SIZE);
+            let mask_uv = world_to_world_uv(pos.xz);
+            let mask_coord = clamp(
+                vec2<i32>(mask_uv * vec2<f32>(WORLD_HEIGHTMAP_SIZE)),
+                vec2<i32>(0),
+                vec2<i32>(mask_size_i - 1),
+            );
+            let mask = textureLoad(water_mask, mask_coord, 0).x;
+            if (mask > 0.5) {
+                material = M_WATER;
+                normal = vec3<f32>(0.0, 1.0, 0.0);
+            }
         }
 
         // Detail breakup texture.
@@ -378,7 +404,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             0,
         );
         let breakup = breakup_tex.x;
-        if (m.material == M_WATER) {
+        if (material == M_WATER) {
             normal = normalize(normal + vec3<f32>(breakup_tex.z, 0.0, breakup_tex.y) * 0.1);
         }
 
@@ -391,7 +417,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
         let r_dir = reflect(rd, normal);
 
-        if (m.material == M_GROUND) {
+        if (material == M_GROUND) {
             // Cliff base.
             diffuse_color = CLIFF_COLOR * smoothstep(0.4, 0.52, pos.y);
             // Dirt over cliff (smoothstep edges flipped to keep WGSL well-defined).
@@ -426,7 +452,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
                 grass_height_mask * grass_slope_mask,
             );
             diffuse_color *= 1.0 + breakup * 0.5;
-        } else if (m.material == M_STRATA) {
+        } else if (material == M_STRATA) {
             let diff = pos.y - map_height(world_xz_to_uv(pos));
             let strata = smoothstep(
                 vec3<f32>(0.0), vec3<f32>(1.0),
@@ -453,7 +479,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
         // Shadow ray (skip for the inside-of-strata case).
         var shadow: f32 = 1.0;
-        if (m.material != M_STRATA) {
+        if (material != M_STRATA) {
             let sh = march(pos + vec3<f32>(0.0, 1.0, 0.0) * 1e-4, sun);
             shadow = 1.0 - exp(-sh.s_t * 20.0);
         }
@@ -485,8 +511,11 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let stepsize = ray_length / 16.0;
     for (var i: f32 = 0.0; i < 16.0; i = i + 1.0) {
         let p = ro + rd * (box.t_near + (i + 0.5) * stepsize);
-        var d = 1.0 - clamp01(max(0.0, p.y - 0.35) / 0.2);
-        if (p.y < 0.35) { d = 0.0; }
+        // Stylised low-altitude haze: full density at sea level (y = 0),
+        // fading to nothing by 1000 m (y = 0.2). Below sea level we have no
+        // atmosphere (the ray is underground inside the box).
+        var d = 1.0 - clamp01(max(0.0, p.y) / 0.2);
+        if (p.y < 0.0) { d = 0.0; }
         let density_r = d * 1e5;
         let density_m = d * 1e5;
         od += stepsize * vec2<f32>(density_r, density_m);

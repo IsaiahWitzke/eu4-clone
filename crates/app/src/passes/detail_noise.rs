@@ -1,5 +1,5 @@
-//! World-anchored detail-noise layer. Same shape as `base_heightmap`, but the
-//! shader also pulls in `noise.wgsl` for the analytic gradient noise.
+//! World-anchored detail-noise layer. Uses only `LayerUniforms` (no input
+//! textures) and pulls in `noise.wgsl` for the analytic gradient noise.
 
 use crate::gpu::{GpuContext, make_pipeline};
 use crate::world_layer::WorldLayer;
@@ -9,7 +9,7 @@ const LAYER_WGSL: &str = include_str!("../shaders/layer.wgsl");
 const NOISE_WGSL: &str = include_str!("../shaders/noise.wgsl");
 const FS_WGSL: &str = include_str!("../shaders/detail_noise.wgsl");
 
-pub fn new(gpu: &GpuContext) -> WorldLayer {
+pub fn build(gpu: &GpuContext, layer_uniform_buf: &wgpu::Buffer) -> WorldLayer {
     let device = &gpu.device;
 
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -47,8 +47,6 @@ pub fn new(gpu: &GpuContext) -> WorldLayer {
         wgpu::TextureFormat::Rgba32Float,
     );
 
-    let layer_uniform_buf = WorldLayer::make_layer_uniform_buf(gpu, "detail_noise layer ub");
-
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("detail_noise bg"),
         layout: &bgl,
@@ -58,11 +56,5 @@ pub fn new(gpu: &GpuContext) -> WorldLayer {
         }],
     });
 
-    WorldLayer::new(
-        gpu,
-        "detail_noise pass",
-        pipeline,
-        bind_group,
-        layer_uniform_buf,
-    )
+    WorldLayer::new(gpu, "detail_noise pass", pipeline, bind_group)
 }

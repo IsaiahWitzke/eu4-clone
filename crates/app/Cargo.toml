@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 eu4-math = { path = "../math" }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
 console_error_panic_hook = "0.1"
 # `webgl` is a wasm32-only feature that compiles in the WebGL2 backend (wgpu-core +
 # wgpu-hal/gles). The default `gles` feature only applies to native Linux/Windows/Android/

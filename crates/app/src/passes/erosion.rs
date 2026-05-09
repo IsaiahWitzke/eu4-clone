@@ -1,7 +1,5 @@
 //! World-anchored erosion layer. Reads the heightmap layer's texture and
-//! runs a Phacelle erosion filter on it. The bind group references
-//! `base_heightmap_view` directly so the erosion shader's `textureLoad` reads
-//! from the heightmap layer's output.
+//! runs a Phacelle erosion filter on it.
 
 use crate::gpu::{GpuContext, make_pipeline};
 use crate::world_layer::WorldLayer;
@@ -11,10 +9,13 @@ const LAYER_WGSL: &str = include_str!("../shaders/layer.wgsl");
 const NOISE_WGSL: &str = include_str!("../shaders/noise.wgsl");
 const FS_WGSL: &str = include_str!("../shaders/terrain.wgsl");
 
-pub fn new(gpu: &GpuContext, base_heightmap_view: &wgpu::TextureView) -> WorldLayer {
+pub fn build(
+    gpu: &GpuContext,
+    layer_uniform_buf: &wgpu::Buffer,
+    base_heightmap_view: &wgpu::TextureView,
+) -> WorldLayer {
     let device = &gpu.device;
 
-    // Bind group: LayerUniforms at 0, base_heightmap texture at 1.
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("erosion bgl"),
         entries: &[
@@ -62,8 +63,6 @@ pub fn new(gpu: &GpuContext, base_heightmap_view: &wgpu::TextureView) -> WorldLa
         wgpu::TextureFormat::Rgba32Float,
     );
 
-    let layer_uniform_buf = WorldLayer::make_layer_uniform_buf(gpu, "erosion layer ub");
-
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("erosion bg"),
         layout: &bgl,
@@ -79,11 +78,5 @@ pub fn new(gpu: &GpuContext, base_heightmap_view: &wgpu::TextureView) -> WorldLa
         ],
     });
 
-    WorldLayer::new(
-        gpu,
-        "erosion pass",
-        pipeline,
-        bind_group,
-        layer_uniform_buf,
-    )
+    WorldLayer::new(gpu, "erosion pass", pipeline, bind_group)
 }

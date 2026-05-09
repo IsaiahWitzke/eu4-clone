@@ -28,13 +28,14 @@ wasm-bindgen \
 cp web/index.html dist/index.html
 
 # 4. Copy runtime assets (heightmap, water mask) into dist/. They're served
-#    directly by the local server and fetched by the wasm at startup, so the
-#    wasm bundle stays small.
-if [ -d "$ROOT/crates/app/assets" ]; then
-  shopt -s nullglob
-  for asset in "$ROOT/crates/app/assets"/*.png; do
-    cp "$asset" "$ROOT/dist/$(basename "$asset")"
-  done
-fi
+#    directly by the local server / GitHub Pages and fetched by the wasm at
+#    startup, so the wasm bundle itself stays small. Listed explicitly so that
+#    incidental files in assets/ (e.g. the local-only preview.png) don't ship.
+for asset in heightmap.png water_mask.png; do
+  src="$ROOT/crates/app/assets/$asset"
+  if [ -f "$src" ]; then
+    cp "$src" "$ROOT/dist/$asset"
+  fi
+done
 
 echo "built dist/ from $WASM_INPUT"

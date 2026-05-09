@@ -195,6 +195,7 @@ dependencies = [
  "bytemuck",
  "console_error_panic_hook",
  "eu4-math",
+ "js-sys",
  "png",
  "wasm-bindgen",
  "wasm-bindgen-futures",
