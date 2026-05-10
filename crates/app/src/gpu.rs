@@ -128,7 +128,14 @@ impl GpuContext {
     }
 }
 
-/// Build a fixed-size `Rgba32Float` texture suitable as both a render target
+/// Pixel format used for every world-anchored offscreen layer. Rgba16Float is
+/// filterable in WebGPU baseline (no `float32-filterable` feature needed), so
+/// the image pass can `textureSampleLevel` the cached layer textures with a
+/// linear sampler. f16 in [0, 1] has ~3 decimal digits of precision — fine
+/// for elevation in fractions of HEIGHT_SCALE_M.
+pub const LAYER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// Build a fixed-size `LAYER_FORMAT` texture suitable as both a render target
 /// and a shader input. Used for offscreen passes (world layers).
 pub fn make_offscreen(
     device: &wgpu::Device,
@@ -146,7 +153,7 @@ pub fn make_offscreen(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba32Float,
+        format: LAYER_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });

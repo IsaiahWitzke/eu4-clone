@@ -12,11 +12,25 @@ use bytemuck::{Pod, Zeroable};
 /// `image.wgsl`.
 pub const CAMERA_FOV_Y_RAD: f32 = std::f32::consts::PI / 6.0; // 30°
 
-pub const DEFAULT_CAMERA_DISTANCE: f32 = 2.6;
+/// Y altitude of the look-at point, in world units (post-VERTICAL_EXAGGERATION).
+/// Must match `CAMERA_TARGET_Y` in `image.wgsl`. Used by both the GPU camera
+/// and the CPU mouse-pick reconstruction.
+pub const CAMERA_TARGET_Y: f32 = 4.0;
+
+/// Approximate world Y of "average ground" for mouse-pick ray intersection.
+/// Picked roughly at the mean elevation in the heightmap (~1500 m × VE/5000 m
+/// = 3.0). Picking error scales with abs(actual_h - HOVER_PICK_Y) * tan(tilt);
+/// at default 15.5° tilt, max worst-case error is ~10 km on 4 km peaks.
+pub const HOVER_PICK_Y: f32 = 3.0;
+
+// World units = km, so distances are in km. Defaults give a country-scale
+// overview of Switzerland; min/max bracket close-up alpine views to nearly
+// stratospheric.
+pub const DEFAULT_CAMERA_DISTANCE: f32 = 300.0;
 pub const DEFAULT_CAMERA_TILT: f32 = 0.27;
 
-pub const MIN_CAMERA_DISTANCE: f32 = 0.8;
-pub const MAX_CAMERA_DISTANCE: f32 = 6.0;
+pub const MIN_CAMERA_DISTANCE: f32 = 5.0;
+pub const MAX_CAMERA_DISTANCE: f32 = 1500.0;
 pub const MIN_CAMERA_TILT: f32 = 0.0;
 pub const MAX_CAMERA_TILT: f32 = std::f32::consts::FRAC_PI_2 - 0.05;
 
@@ -68,6 +82,29 @@ impl Aabb2 {
     }
 }
 
+// ---- Map modes -----------------------------------------------------------
+
+/// Which information layer the renderer is showing right now.
+///
+/// Discriminants are mirrored as `MAP_MODE_*` constants in `image.wgsl`; do
+/// not reorder without updating both sides.
+#[repr(u32)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum MapMode {
+    #[default]
+    Terrain = 0,
+    Political = 1,
+}
+
+impl MapMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Terrain => Self::Political,
+            Self::Political => Self::Terrain,
+        }
+    }
+}
+
 // ---- Camera --------------------------------------------------------------
 
 #[derive(Copy, Clone, Debug)]
@@ -75,6 +112,11 @@ pub struct Camera {
     pub world_center: [f32; 2],
     pub distance: f32,
     pub tilt: f32,
+    pub map_mode: MapMode,
+    /// Currently-hovered province ID, or 0 = nothing hovered. Updated by the
+    /// renderer's mouse-pick path; consumed by the shader to draw a
+    /// highlight overlay on the matching province.
+    pub hovered_pid: u32,
 }
 
 impl Camera {
@@ -83,7 +125,14 @@ impl Camera {
             world_center: [0.0, 0.0],
             distance: DEFAULT_CAMERA_DISTANCE,
             tilt: DEFAULT_CAMERA_TILT,
+            map_mode: MapMode::default(),
+            hovered_pid: 0,
         }
+    }
+
+    /// Cycle to the next map mode.
+    pub fn cycle_map_mode(&mut self) {
+        self.map_mode = self.map_mode.next();
     }
 
     /// Visible world rectangle for the given canvas aspect ratio (width/height).
@@ -133,17 +182,87 @@ impl Camera {
         ]
     }
 
+    /// Reconstruct the ray for a CSS-pixel screen position and intersect it
+    /// with the horizontal plane at `y_target`. Returns the world XZ at the
+    /// intersection, or `None` if the ray is parallel to / above the plane.
+    /// This mirrors the shader's `get_ray()` exactly.
+    pub fn pick_world_xz(
+        &self,
+        mx: f32,
+        my: f32,
+        css_w: f32,
+        css_h: f32,
+        y_target: f32,
+    ) -> Option<[f32; 2]> {
+        let look_at = [
+            self.world_center[0],
+            CAMERA_TARGET_Y,
+            self.world_center[1],
+        ];
+        let off = self.eye_offset();
+        let eye = [
+            look_at[0] + off[0],
+            look_at[1] + off[1],
+            look_at[2] + off[2],
+        ];
+
+        // forward = normalize(look_at - eye)
+        let forward = normalize3([
+            look_at[0] - eye[0],
+            look_at[1] - eye[1],
+            look_at[2] - eye[2],
+        ]);
+        let world_up = [0.0_f32, 1.0, 0.0];
+        let right = normalize3(cross3(world_up, forward));
+        let up = cross3(forward, right);
+
+        let aspect = css_w / css_h.max(1.0);
+        let tan_half_y = (CAMERA_FOV_Y_RAD * 0.5).tan();
+        let tan_half_x = tan_half_y * aspect;
+        let ndc_x = (mx / css_w.max(1.0)) * 2.0 - 1.0;
+        let ndc_y = 1.0 - (my / css_h.max(1.0)) * 2.0;
+
+        let rd = normalize3([
+            forward[0] + right[0] * ndc_x * tan_half_x + up[0] * ndc_y * tan_half_y,
+            forward[1] + right[1] * ndc_x * tan_half_x + up[1] * ndc_y * tan_half_y,
+            forward[2] + right[2] * ndc_x * tan_half_x + up[2] * ndc_y * tan_half_y,
+        ]);
+
+        if rd[1].abs() < 1e-6 {
+            return None;
+        }
+        let t = (y_target - eye[1]) / rd[1];
+        if !t.is_finite() || t <= 0.0 {
+            return None;
+        }
+        Some([eye[0] + rd[0] * t, eye[2] + rd[2] * t])
+    }
+
     /// Build the GPU uniform block for the image pass.
     pub fn to_uniforms(&self, width: u32, height: u32) -> CameraUniforms {
         CameraUniforms {
             i_resolution: [width as f32, height as f32, 1.0],
             i_time: 0.0,
             world_center: self.world_center,
-            _pad0: [0.0; 2],
+            hovered_pid: self.hovered_pid,
+            _pad0: 0,
             eye_offset: self.eye_offset(),
-            _pad1: 0.0,
+            map_mode: self.map_mode as u32,
         }
     }
+}
+
+// ---- vec3 helpers (private) ----------------------------------------------
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+fn normalize3(v: [f32; 3]) -> [f32; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-20);
+    [v[0] / len, v[1] / len, v[2] / len]
 }
 
 impl Default for Camera {
@@ -155,15 +274,21 @@ impl Default for Camera {
 // ---- GPU uniform block ---------------------------------------------------
 
 /// Mirrors the WGSL `Uniforms` struct in `shaders/camera.wgsl`. Layout:
-/// vec3 (16-byte aligned), then the trailing f32, then vec2, vec2 pad,
-/// vec3, f32 pad → 48 bytes total.
+/// vec3 (16-byte aligned), trailing f32, vec2, then `hovered_pid` + pad
+/// occupying what used to be `_pad0`'s 8 bytes, then vec3 + `map_mode: u32`
+/// in the vec3's trailing pad. 48 bytes total.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct CameraUniforms {
     pub i_resolution: [f32; 3],
     pub i_time: f32,
     pub world_center: [f32; 2],
-    pub _pad0: [f32; 2],
+    /// Currently-hovered province ID (0 = none). Set on the Rust side from
+    /// the latest mouse position.
+    pub hovered_pid: u32,
+    pub _pad0: u32,
     pub eye_offset: [f32; 3],
-    pub _pad1: f32,
+    /// Mirrors `MapMode` discriminants. Stored as `u32` so the shader can
+    /// branch directly on it without a float→int conversion.
+    pub map_mode: u32,
 }

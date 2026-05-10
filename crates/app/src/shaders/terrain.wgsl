@@ -183,17 +183,20 @@ fn erosion_filter(
 // Fetches the painted heightmap from the base layer at the same texel and
 // runs it through the erosion filter. Returns the eroded height in .x.
 fn heightmap(frag_xy: vec2<f32>, world_pos: vec2<f32>) -> vec4<f32> {
-    // Erosion parameters — verbatim from the original demo.
-    let erosion_scale: f32 = 0.15;
-    let erosion_strength: f32 = 0.22;
-    let erosion_gully_weight: f32 = 0.5;
-    let erosion_detail: f32 = 1.5;
+    // "Subtle" preset: ~±50 m of added detail, gentle ridges. Tuned for
+    // real Swiss elevation data — the original Shadertoy values were
+    // calibrated for a procedural [0.45, 0.55] band, which is 10× narrower
+    // than the [0, 1] range we get from the actual heightmap.
+    let erosion_scale: f32 = 0.05;
+    let erosion_strength: f32 = 0.01;
+    let erosion_gully_weight: f32 = 0.4;
+    let erosion_detail: f32 = 1.2;
     let erosion_rounding = vec4<f32>(0.1, 0.0, 0.1, 2.0);
     let erosion_onset = vec4<f32>(0.7, 1.25, 2.8, 1.5);
     let erosion_assumed_slope = vec2<f32>(0.7, 1.0);
     let erosion_cell_scale: f32 = 0.7;
     let erosion_normalization: f32 = 0.5;
-    let erosion_octaves: i32 = 5;
+    let erosion_octaves: i32 = 4;
     let erosion_lacunarity: f32 = 2.0;
     let erosion_gain: f32 = 0.5;
 
@@ -203,8 +206,11 @@ fn heightmap(frag_xy: vec2<f32>, world_pos: vec2<f32>) -> vec4<f32> {
     let coord = vec2<i32>(frag_xy);
     let n = textureLoad(base_heightmap, coord, 0).xyz;
 
-    // Fade target: -1 at valleys, +1 at peaks (extrapolated from baseline).
-    let fade_target = clamp((n.x - DEFAULT_HEIGHT) / 0.15, -1.0, 1.0);
+    // Fade target: -1 at Swiss valleys, +1 at Swiss peaks. Calibrated around
+    // Switzerland's actual normalised elevation distribution (mean ≈ 0.27,
+    // half-range ≈ 0.45 in [0, 1] units = [0, 5000 m]) instead of the
+    // Shadertoy's procedural plain at 0.45.
+    let fade_target = clamp((n.x - 0.27) / 0.45, -1.0, 1.0);
 
     let r = erosion_filter(
         world_pos, n, fade_target,

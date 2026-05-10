@@ -16,6 +16,11 @@ const WORLD_BOUNDS_HALF: vec2<f32> = vec2<f32>(313.037, 313.037);
 
 // Map a world XZ coordinate into the [0, 1] UV of the world heightmap +
 // water mask textures.
+//
+// World convention: world Z = +north. PNG row 0 (uv.y = 0) sits at the
+// highest Mercator northing, i.e. geographic north. So world_z = +HALF
+// (north) must map to uv.y = 0 (top of texture) — that's why we flip Y.
 fn world_to_world_uv(world_xz: vec2<f32>) -> vec2<f32> {
-    return (world_xz + WORLD_BOUNDS_HALF) / (2.0 * WORLD_BOUNDS_HALF);
+    let uv = (world_xz + WORLD_BOUNDS_HALF) / (2.0 * WORLD_BOUNDS_HALF);
+    return vec2<f32>(uv.x, 1.0 - uv.y);
 }

@@ -28,6 +28,12 @@ web-sys = { version = "0.3", features = [
     "HtmlCanvasElement",
     "KeyboardEvent",
     "MouseEvent",
+    "WheelEvent",
+    # Needed to register the wheel listener as non-passive so we can
+    # prevent_default() on it (suppresses native page scrolling while zooming).
+    "AddEventListenerOptions",
+    # `performance.now()` for the frame profiler.
+    "Performance",
     # Required for fetching assets at runtime.
     "Request",
     "RequestInit",

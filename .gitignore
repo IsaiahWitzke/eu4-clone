@@ -2,6 +2,8 @@
 # `dist/` is built fresh on every CI run by .github/workflows/static.yml, so
 # we ignore it locally and don't track it in git.
 /dist
+# Project-local Python venv used by `script/gen-border-sdf` etc.
+/.venv
 
 # OS / tool junk.
 .DS_Store
@@ -14,5 +16,13 @@
 /crates/app/assets/tiles/
 /crates/app/assets/natural_earth/
 /crates/app/assets/swiss.vrt
-/crates/app/assets/water_mask.tif
 /crates/app/assets/preview.png
+# Raw source data for the categorical masks: NUTS shapefiles (~295MB),
+# WWF / RESOLVE Ecoregions biome data (~375MB). The committed final
+# products are the .png masks; these are regenerable via
+# `script/gen-border-sdf` etc.
+/crates/app/assets/nuts/
+/crates/app/assets/wwf/
+# Intermediate .tif rasterizations from gdal_rasterize. The .png assets
+# next to them are the final committed products.
+/crates/app/assets/*.tif

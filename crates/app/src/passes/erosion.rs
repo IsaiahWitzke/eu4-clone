@@ -1,7 +1,7 @@
 //! World-anchored erosion layer. Reads the heightmap layer's texture and
 //! runs a Phacelle erosion filter on it.
 
-use crate::gpu::{GpuContext, make_pipeline};
+use crate::gpu::{GpuContext, LAYER_FORMAT, make_pipeline};
 use crate::world_layer::WorldLayer;
 
 const COMMON_WGSL: &str = include_str!("../shaders/common.wgsl");
@@ -60,7 +60,7 @@ pub fn build(
         "erosion pipeline",
         &pipeline_layout,
         &module,
-        wgpu::TextureFormat::Rgba32Float,
+        LAYER_FORMAT,
     );
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {

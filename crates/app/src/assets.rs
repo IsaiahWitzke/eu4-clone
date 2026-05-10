@@ -63,12 +63,10 @@ fn decode_grayscale_png(bytes: &[u8]) -> Result<DecodedPng, String> {
         return Err(format!("expected grayscale, got {:?}", info.color_type));
     }
 
-    // 16-bit PNGs store samples big-endian per spec; wgpu wants native LE.
-    if bit_depth == 16 {
-        for chunk in buf.chunks_exact_mut(2) {
-            chunk.swap(0, 1);
-        }
-    }
+    // 16-bit grayscale PNGs store samples big-endian per spec: [hi, lo, hi, lo, ...].
+    // We upload that buffer verbatim into an `Rg8Unorm` texture so byte 0 ends up
+    // in the R channel and byte 1 in the G channel — the shader reassembles them.
+    // 8-bit grayscale needs no transformation.
 
     Ok(DecodedPng {
         width: info.width,

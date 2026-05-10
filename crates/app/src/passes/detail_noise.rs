@@ -1,7 +1,7 @@
 //! World-anchored detail-noise layer. Uses only `LayerUniforms` (no input
 //! textures) and pulls in `noise.wgsl` for the analytic gradient noise.
 
-use crate::gpu::{GpuContext, make_pipeline};
+use crate::gpu::{GpuContext, LAYER_FORMAT, make_pipeline};
 use crate::world_layer::WorldLayer;
 
 const COMMON_WGSL: &str = include_str!("../shaders/common.wgsl");
@@ -44,7 +44,7 @@ pub fn build(gpu: &GpuContext, layer_uniform_buf: &wgpu::Buffer) -> WorldLayer {
         "detail_noise pipeline",
         &pipeline_layout,
         &module,
-        wgpu::TextureFormat::Rgba32Float,
+        LAYER_FORMAT,
     );
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {

@@ -13,7 +13,7 @@
 use bytemuck;
 use web_sys::HtmlCanvasElement;
 
-use crate::camera::{Aabb2, Camera, CameraUniforms};
+use crate::camera::{Aabb2, Camera, CameraUniforms, HOVER_PICK_Y};
 use crate::gpu::{GpuContext, compute_canvas_size};
 use crate::passes::{base_heightmap, detail_noise, erosion, image::ImagePass, image as image_pass};
 use crate::world_layer::{LAYER_SIZE, LayerUniforms, WorldLayer, make_layer_uniform_buf};
@@ -24,6 +24,11 @@ const PAD: f32 = 2.0;
 
 /// Width/height of the asset textures (heightmap.png + water_mask.png).
 const WORLD_TEX_SIZE: u32 = 8192;
+
+/// Half-extent of the world rectangle (km). Mirrors `WORLD_BOUNDS_HALF` in
+/// `shaders/world.wgsl`. Used by the CPU mouse-pick code to map world XZ
+/// back into province-mask UV coords.
+const WORLD_BOUNDS_HALF_KM: f32 = 313.037;
 
 pub struct Renderer {
     pub gpu: GpuContext,
@@ -47,6 +52,26 @@ pub struct Renderer {
     world_heightmap_view: wgpu::TextureView,
     water_mask_tex: wgpu::Texture,
     water_mask_view: wgpu::TextureView,
+    /// Biome IDs (R8Unorm; pixel value = biome number 0..14, where 0 is
+    /// "no biome / not classified"). Sampled with textureLoad in the shader.
+    biome_mask_tex: wgpu::Texture,
+    biome_mask_view: wgpu::TextureView,
+    /// Province IDs (Rg8Unorm carrying a 16-bit big-endian unsigned integer
+    /// per pixel; 0 = "no province"). Sampled with textureLoad in the shader
+    /// and reassembled to a `u32` ID for political coloring.
+    province_mask_tex: wgpu::Texture,
+    province_mask_view: wgpu::TextureView,
+    /// CPU-side copy of the province-mask bytes, kept around so we can
+    /// resolve a screen-space mouse position to a province ID without
+    /// round-tripping to the GPU. None until the PNG finishes loading.
+    province_mask_bytes: Option<Vec<u8>>,
+    /// Border signed-distance-field (R8Unorm; pixel value = clamped
+    /// distance-to-nearest-border encoded as 0..255). Pre-baked offline by
+    /// `script/gen-border-sdf` from the smoothed NUTS-3 boundaries.
+    /// **Filterable** — the shader bilinearly samples it and runs the result
+    /// through smoothstep for AA'd, thickness-controllable borders.
+    border_sdf_tex: wgpu::Texture,
+    border_sdf_view: wgpu::TextureView,
 
     /// Bind-group layouts kept around for swap-in.
     base_heightmap_bgl: wgpu::BindGroupLayout,
@@ -84,10 +109,26 @@ impl Renderer {
         });
 
         // 1×1 placeholders so the bind groups are valid before the PNGs land.
+        // The heightmap uses Rg8Unorm — the PNG ships 16-bit grayscale as
+        // [hi, lo] BE bytes per pixel, which we upload verbatim into the two
+        // 8-bit channels and reassemble in the shader.
         let (world_heightmap_tex, world_heightmap_view) =
-            placeholder_r16unorm(&gpu, "world_heightmap (placeholder)");
+            placeholder_rg8unorm(&gpu, "world_heightmap (placeholder)");
         let (water_mask_tex, water_mask_view) =
             placeholder_r8unorm(&gpu, "water_mask (placeholder)");
+        // Biome 0 → "no biome / fall through to default land color", which is
+        // the safe behaviour while the real biome mask is in flight.
+        let (biome_mask_tex, biome_mask_view) =
+            placeholder_r8unorm(&gpu, "biome_mask (placeholder)");
+        // Province 0 → "no province". Same Rg8Unorm split-bytes encoding as
+        // the heightmap (the PNG is 16-bit grayscale, big-endian).
+        let (province_mask_tex, province_mask_view) =
+            placeholder_rg8unorm(&gpu, "province_mask (placeholder)");
+        // Border SDF: 1×1 R8Unorm value 255 → "infinite distance to any
+        // border", which makes the border smoothstep return 0 (no darkening)
+        // until the real PNG lands.
+        let (border_sdf_tex, border_sdf_view) =
+            placeholder_texture(&gpu, "border_sdf (placeholder)", wgpu::TextureFormat::R8Unorm, &[255u8]);
 
         let base_heightmap_bgl = base_heightmap::bgl(&gpu.device);
         let image_bgl = image_pass::bgl(&gpu.device);
@@ -110,6 +151,10 @@ impl Renderer {
             &erosion.view,
             &layer_uniform_buf,
             &water_mask_view,
+            &sampler,
+            &biome_mask_view,
+            &province_mask_view,
+            &border_sdf_view,
         );
 
         Self {
@@ -123,6 +168,13 @@ impl Renderer {
             world_heightmap_view,
             water_mask_tex,
             water_mask_view,
+            biome_mask_tex,
+            biome_mask_view,
+            province_mask_tex,
+            province_mask_view,
+            province_mask_bytes: None,
+            border_sdf_tex,
+            border_sdf_view,
             base_heightmap_bgl,
             image_bgl,
             base_heightmap,
@@ -207,11 +259,11 @@ impl Renderer {
         let tex = upload_world_texture(
             &self.gpu,
             "world_heightmap",
-            wgpu::TextureFormat::R16Unorm,
+            wgpu::TextureFormat::Rg8Unorm,
             width,
             height,
             bytes,
-            2, // bytes per pixel
+            2, // bytes per pixel: 16-bit grayscale PNG split across R + G
         );
         let view = tex.create_view(&Default::default());
         self.world_heightmap_tex = tex;
@@ -258,6 +310,135 @@ impl Renderer {
         self.rebuild_image_bind_group();
     }
 
+    /// Upload a fresh 8192² Rg8Unorm province mask. The PNG is 16-bit
+    /// grayscale (big-endian); we upload the [hi, lo] bytes verbatim into
+    /// R + G channels and let the shader reassemble them. ID 0 = "no
+    /// province". Also keeps a CPU copy of the bytes for mouse-pick.
+    pub fn set_province_mask(&mut self, width: u32, height: u32, bytes: &[u8]) {
+        if (width, height) != (WORLD_TEX_SIZE, WORLD_TEX_SIZE) {
+            web_sys::console::warn_1(
+                &format!(
+                    "province mask size mismatch: got {width}x{height}, expected \
+                     {WORLD_TEX_SIZE}\u{00d7}{WORLD_TEX_SIZE}"
+                )
+                .into(),
+            );
+        }
+        let tex = upload_world_texture(
+            &self.gpu,
+            "province_mask",
+            wgpu::TextureFormat::Rg8Unorm,
+            width,
+            height,
+            bytes,
+            2, // bytes per pixel: 16-bit grayscale split across R + G
+        );
+        let view = tex.create_view(&Default::default());
+        self.province_mask_tex = tex;
+        self.province_mask_view = view;
+        // Clone for CPU-side hover picking. ~128 MB at full resolution but
+        // happens once per session.
+        self.province_mask_bytes = Some(bytes.to_vec());
+        self.rebuild_image_bind_group();
+    }
+
+    /// Update the hovered-province state from a screen-space mouse position
+    /// (CSS pixels). Returns `true` iff the hovered province changed (so the
+    /// caller can avoid redundant frames).
+    pub fn update_hover(&mut self, mx: f32, my: f32, css_w: f32, css_h: f32) -> bool {
+        let prev = self.camera.hovered_pid;
+        let pid = self
+            .camera
+            .pick_world_xz(mx, my, css_w, css_h, HOVER_PICK_Y)
+            .map(|xz| self.province_at_world_xz(xz))
+            .unwrap_or(0);
+        if pid != prev {
+            self.camera.hovered_pid = pid;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Look up the province ID at a world XZ position, using the CPU copy
+    /// of the province mask. Returns 0 if the position is out of bounds or
+    /// the mask isn't loaded yet.
+    fn province_at_world_xz(&self, xz: [f32; 2]) -> u32 {
+        let bytes = match &self.province_mask_bytes {
+            Some(b) => b,
+            None => return 0,
+        };
+        let half = WORLD_BOUNDS_HALF_KM;
+        let u = (xz[0] + half) / (2.0 * half);
+        // Y flip mirrors `world_to_world_uv` in shaders/world.wgsl.
+        let v = 1.0 - (xz[1] + half) / (2.0 * half);
+        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+            return 0;
+        }
+        let w = WORLD_TEX_SIZE;
+        let px = ((u * w as f32) as i32).clamp(0, (w as i32) - 1) as u32;
+        let py = ((v * w as f32) as i32).clamp(0, (w as i32) - 1) as u32;
+        let idx = ((py * w + px) as usize) * 2;
+        let hi = bytes[idx] as u32;
+        let lo = bytes[idx + 1] as u32;
+        hi * 256 + lo
+    }
+
+    /// Upload a fresh 8192² R8Unorm border SDF. Pixel value 0 = on a border;
+    /// 255 = ≥ MAX_DIST_PX away. The shader bilinearly samples and runs it
+    /// through smoothstep to draw smooth, AA'd, thickness-tunable borders.
+    pub fn set_border_sdf(&mut self, width: u32, height: u32, bytes: &[u8]) {
+        if (width, height) != (WORLD_TEX_SIZE, WORLD_TEX_SIZE) {
+            web_sys::console::warn_1(
+                &format!(
+                    "border SDF size mismatch: got {width}x{height}, expected \
+                     {WORLD_TEX_SIZE}\u{00d7}{WORLD_TEX_SIZE}"
+                )
+                .into(),
+            );
+        }
+        let tex = upload_world_texture(
+            &self.gpu,
+            "border_sdf",
+            wgpu::TextureFormat::R8Unorm,
+            width,
+            height,
+            bytes,
+            1, // bytes per pixel
+        );
+        let view = tex.create_view(&Default::default());
+        self.border_sdf_tex = tex;
+        self.border_sdf_view = view;
+        self.rebuild_image_bind_group();
+    }
+
+    /// Upload a fresh 8192² R8Unorm biome mask. Pixel values are biome IDs
+    /// (0..14, with 0 = "no biome"). Mirrors `set_water_mask`.
+    pub fn set_biome_mask(&mut self, width: u32, height: u32, bytes: &[u8]) {
+        if (width, height) != (WORLD_TEX_SIZE, WORLD_TEX_SIZE) {
+            web_sys::console::warn_1(
+                &format!(
+                    "biome mask size mismatch: got {width}x{height}, expected \
+                     {WORLD_TEX_SIZE}\u{00d7}{WORLD_TEX_SIZE}"
+                )
+                .into(),
+            );
+        }
+        let tex = upload_world_texture(
+            &self.gpu,
+            "biome_mask",
+            wgpu::TextureFormat::R8Unorm,
+            width,
+            height,
+            bytes,
+            1, // bytes per pixel
+        );
+        let view = tex.create_view(&Default::default());
+        self.biome_mask_tex = tex;
+        self.biome_mask_view = view;
+        self.rebuild_image_bind_group();
+    }
+
     fn rebuild_image_bind_group(&mut self) {
         self.image.bind_group = image_pass::make_bind_group(
             &self.gpu.device,
@@ -268,15 +449,20 @@ impl Renderer {
             &self.erosion.view,
             &self.layer_uniform_buf,
             &self.water_mask_view,
+            &self.sampler,
+            &self.biome_mask_view,
+            &self.province_mask_view,
+            &self.border_sdf_view,
         );
     }
 }
 
 // ---- Helpers ---------------------------------------------------------------
 
-/// Build a 1×1 R16Unorm placeholder, value 0.
-fn placeholder_r16unorm(gpu: &GpuContext, label: &str) -> (wgpu::Texture, wgpu::TextureView) {
-    placeholder_texture(gpu, label, wgpu::TextureFormat::R16Unorm, &[0u8, 0u8])
+/// Build a 1×1 Rg8Unorm placeholder, value (0, 0). Used for the world
+/// heightmap until the real PNG lands.
+fn placeholder_rg8unorm(gpu: &GpuContext, label: &str) -> (wgpu::Texture, wgpu::TextureView) {
+    placeholder_texture(gpu, label, wgpu::TextureFormat::Rg8Unorm, &[0u8, 0u8])
 }
 
 /// Build a 1×1 R8Unorm placeholder, value 0.

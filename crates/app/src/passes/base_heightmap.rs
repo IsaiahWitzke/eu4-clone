@@ -6,7 +6,7 @@
 //! the bind group whenever the world heightmap texture is swapped out (e.g.
 //! when the async PNG fetch completes).
 
-use crate::gpu::{GpuContext, make_pipeline};
+use crate::gpu::{GpuContext, LAYER_FORMAT, make_pipeline};
 use crate::world_layer::WorldLayer;
 
 const COMMON_WGSL: &str = include_str!("../shaders/common.wgsl");
@@ -104,7 +104,7 @@ pub fn build(
         "base_heightmap pipeline",
         &pipeline_layout,
         &module,
-        wgpu::TextureFormat::Rgba32Float,
+        LAYER_FORMAT,
     );
 
     let bind_group =
