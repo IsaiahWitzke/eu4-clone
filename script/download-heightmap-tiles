@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""
+Download Mapzen `terrarium` PNG tiles covering `WORLD_BBOX` at zoom Z.
+
+Output layout: `crates/app/assets/tiles/z{Z}/{x}_{y}.png` so multiple zoom
+levels can coexist. Each tile is a 256\u00d7256 PNG where elevation is
+encoded in RGB:
+    elevation_m = (R * 256 + G + B / 256) - 32768
+
+Concurrent fetches via `ThreadPoolExecutor`. Already-present tiles are
+skipped, so re-running is cheap.
+
+Run from the project root with the project venv:
+    ./.venv/bin/python3 script/download-heightmap-tiles
+"""
+import math
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _world import ASSETS_DIR, WORLD_BBOX  # noqa: E402
+
+# Slippy-map zoom level. z=7 \u2192 314 km per tile, ~1.22 km/px \u2014 a close
+# match for the 4096\u00b2 \u00d7 5500 km world (~1.34 km/px), which means we'll be
+# essentially 1:1 sampling rather than oversampling. Bumping to z=8 would
+# 4\u00d7 the tile count for sharper mountains; not worth it at this output
+# resolution.
+ZOOM = 7
+
+# Mercator world half-extent (matches the standard Web-Mercator definition).
+MERC_HALF = 20037508.342789244
+
+TILE_DIR = ASSETS_DIR / "tiles" / f"z{ZOOM}"
+URL_PATTERN = (
+    "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+)
+USER_AGENT = "eu4-clone-asset-pipeline/1.0"
+MAX_WORKERS = 16
+
+
+def tile_range(zoom: int):
+    """
+    Compute the inclusive XY tile range covering WORLD_BBOX at `zoom`.
+
+    Slippy-map tile space at zoom Z has 2^Z tiles per axis. X grows to
+    the east; Y grows to the south, so the tile that contains the
+    northern edge of the bbox has the *smaller* Y index.
+    """
+    n = 2 ** zoom
+    span = 2.0 * MERC_HALF
+    xmin, ymin, xmax, ymax = WORLD_BBOX
+
+    def merc_to_tx(x):
+        return int(math.floor((x + MERC_HALF) / span * n))
+
+    def merc_to_ty(y):
+        # y=+MERC_HALF is north \u2192 tile_y=0; y=-MERC_HALF is south \u2192 tile_y=n-1.
+        return int(math.floor((MERC_HALF - y) / span * n))
+
+    x0 = merc_to_tx(xmin)
+    x1 = merc_to_tx(xmax)
+    y0 = merc_to_ty(ymax)  # north \u2192 smaller tile_y
+    y1 = merc_to_ty(ymin)  # south \u2192 larger tile_y
+    # Clamp to valid tile range.
+    x0 = max(0, x0)
+    x1 = min(n - 1, x1)
+    y0 = max(0, y0)
+    y1 = min(n - 1, y1)
+    return x0, x1, y0, y1
+
+
+def fetch_tile(zoom: int, x: int, y: int, dest: Path) -> str:
+    """Download one tile to `dest`. Returns one of: "ok", "skip", "fail"."""
+    if dest.exists() and dest.stat().st_size > 0:
+        return "skip"
+    url = URL_PATTERN.format(z=zoom, x=x, y=y)
+    req = Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urlopen(req, timeout=30) as r:
+            data = r.read()
+    except (HTTPError, URLError, TimeoutError) as e:
+        sys.stderr.write(f"  fetch failed {x}/{y}: {e}\n")
+        return "fail"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    return "ok"
+
+
+def main():
+    x0, x1, y0, y1 = tile_range(ZOOM)
+    tiles = [(x, y) for y in range(y0, y1 + 1) for x in range(x0, x1 + 1)]
+    n_total = len(tiles)
+    print(
+        f"z={ZOOM} bbox covers tile range x=[{x0}..{x1}] y=[{y0}..{y1}] "
+        f"({n_total} tiles)"
+    )
+    print(f"Downloading to {TILE_DIR.relative_to(ASSETS_DIR.parent.parent)}/")
+
+    t0 = time.time()
+    counts = {"ok": 0, "skip": 0, "fail": 0}
+
+    def task(xy):
+        x, y = xy
+        dest = TILE_DIR / f"{x}_{y}.png"
+        return fetch_tile(ZOOM, x, y, dest)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        for i, status in enumerate(pool.map(task, tiles), 1):
+            counts[status] += 1
+            if i % 50 == 0 or i == n_total:
+                rate = i / max(1e-3, time.time() - t0)
+                print(
+                    f"  {i}/{n_total}  "
+                    f"ok={counts['ok']} skip={counts['skip']} fail={counts['fail']}  "
+                    f"({rate:.1f} tiles/s)"
+                )
+
+    print(
+        f"done in {time.time() - t0:.1f}s: "
+        f"{counts['ok']} downloaded, {counts['skip']} cached, {counts['fail']} failed"
+    )
+    if counts["fail"]:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

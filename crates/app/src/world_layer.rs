@@ -82,7 +82,15 @@ impl WorldLayer {
     /// Render this layer's pipeline (a fullscreen triangle) into its texture.
     /// The caller is responsible for ensuring the shared `LayerUniforms`
     /// buffer is up-to-date before issuing this.
-    pub fn render(&self, encoder: &mut wgpu::CommandEncoder) {
+    ///
+    /// `timestamp_writes` lets the caller bracket this render pass with
+    /// `TIMESTAMP_QUERY` writes for GPU profiling; pass `None` for the
+    /// normal path.
+    pub fn render(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(self.label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -95,7 +103,7 @@ impl WorldLayer {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes,
             occlusion_query_set: None,
             multiview_mask: None,
         });

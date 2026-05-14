@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Generate an SDF (signed-distance-field) glyph atlas for the realm-label
+render pass.
+
+The atlas is a single PNG; the per-glyph metrics are a sibling JSON file.
+At runtime the Rust side (`crate::glyph_atlas`) loads both, uploads the
+PNG to a GPU texture, and looks up glyph rectangles by character.
+
+Pipeline per glyph
+------------------
+1. Rasterize the glyph at a high "rendered" resolution (`HIGH_RES`) using
+   freetype's anti-aliased grayscale renderer. This gives a clean
+   horizontal-line / curved-edge mask.
+2. Threshold to binary (inside/outside).
+3. Compute the signed Euclidean distance transform: positive distance
+   outside the glyph, negative inside. (`scipy.ndimage.distance_transform_edt`)
+4. Clamp to the SDF range (`+/- SDF_SPREAD`) and remap to [0, 255].
+5. Downsample the 8-bit field by `DOWNSAMPLE` (high-res quality, low-res
+   storage). Bilinear is fine because SDFs are smooth.
+6. Pack the result into the atlas using a simple shelf-pack algorithm.
+
+The font asset is IM Fell English (SIL OFL) from Google Fonts; if the TTF
+isn't already vendored at `crates/app/assets/fonts/`, the script downloads
+it once. The downloaded file is cached locally so repeated runs are fast.
+
+Outputs
+-------
+* `crates/app/assets/glyph_atlas.png`  RGBA8 (single-channel SDF in R, A=255)
+* `crates/app/assets/glyph_atlas.json` per-glyph metrics + atlas metadata
+
+Usage
+-----
+    pip install Pillow numpy scipy freetype-py
+    script/gen-glyph-atlas            # writes atlas + json
+"""
+from __future__ import annotations
+
+import json
+import os
+import struct
+import sys
+import urllib.request
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+from scipy.ndimage import distance_transform_edt  # type: ignore
+
+import freetype  # type: ignore
+
+
+# -- Tunables --------------------------------------------------------------
+
+# Per-glyph rendered resolution (px). Higher = more accurate distance
+# transform, at the cost of a bigger one-time bake. 256 is plenty for
+# the curves in IM Fell English; the SDF is downsampled before packing.
+HIGH_RES = 256
+
+# Downsampling factor between the high-res render and the atlas tile.
+# 4 → each glyph occupies ~64x64 in the atlas, which is enough for crisp
+# rendering up to ~1500 px text height on screen (the SDF stays smooth
+# under bilinear).
+DOWNSAMPLE = 4
+
+# Half-width of the SDF range, in *high-res* pixels. Distances outside
+# [-SDF_SPREAD, +SDF_SPREAD] are clamped. Larger spread = softer outlines
+# / glow effects available in the shader, smaller = sharper edge but no
+# room for distance-based effects. 16 high-res px ≈ 4 atlas px after
+# DOWNSAMPLE=4, which gives the shader enough dynamic range to do AA via
+# fwidth() at every reasonable zoom.
+SDF_SPREAD = 16
+
+# Atlas dimensions (square, RGBA8). 1024² fits ASCII printable +
+# common Latin-1 accents at 64x64 per tile with room to spare.
+ATLAS_SIZE = 1024
+
+# Padding between packed glyphs (in atlas pixels). Avoids bilinear
+# bleed between neighbours.
+PAD = 2
+
+# Characters to bake. ASCII printable (0x20..0x7E) plus a handful of
+# Latin-1 accents we hit in our city / realm names (umlauts, accents,
+# the Eszett). Add more as needed; the atlas is regenerated whenever
+# this list changes.
+CHARSET = (
+    [chr(c) for c in range(0x20, 0x7F)]
+    + list("ÄÖÜßäöüáéíóúàèìòùâêîôûãñÀÂÄÉÈÊËÎÏÔÖÛÜÇÑ")
+)
+
+# Font on disk + Google-Fonts download fallback. The Roman ("rm") cut
+# is the regular weight; "it" is italic. The historical filename uses
+# the original IM Fell short tag.
+FONT_URL = (
+    "https://raw.githubusercontent.com/google/fonts/main/"
+    "ofl/imfellenglish/IMFeENrm28P.ttf"
+)
+FONT_NAME = "IMFellEnglish-Regular.ttf"
+
+ROOT = Path(__file__).resolve().parents[1]
+ASSETS = ROOT / "crates" / "app" / "assets"
+FONT_DIR = ASSETS / "fonts"
+FONT_PATH = FONT_DIR / FONT_NAME
+ATLAS_PNG = ASSETS / "glyph_atlas.png"
+ATLAS_JSON = ASSETS / "glyph_atlas.json"
+
+
+def ensure_font() -> Path:
+    """Return the path to the IM Fell English TTF, downloading if missing."""
+    if FONT_PATH.exists():
+        return FONT_PATH
+    print(f"  fetching {FONT_URL} -> {FONT_PATH}")
+    FONT_DIR.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(FONT_URL) as resp:
+        FONT_PATH.write_bytes(resp.read())
+    return FONT_PATH
+
+
+def render_glyph(face: freetype.Face, ch: str) -> tuple[np.ndarray | None, dict]:
+    """Render a single glyph at HIGH_RES.
+
+    Returns:
+      * the high-res grayscale bitmap (uint8, 0..255, glyph in white)
+      * a metrics dict in *high-res pixel* units; the caller converts to
+        atlas / EM units before serialising.
+    """
+    # FreeType glyph indices: 0 = .notdef. We skip glyphs the font lacks
+    # rather than emitting a default-square box.
+    gindex = face.get_char_index(ord(ch))
+    if gindex == 0 and ch != ".":
+        # treat as missing; the layout side will fall back to a space.
+        return None, {}
+
+    face.load_glyph(gindex, freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_NORMAL)
+    bm = face.glyph.bitmap
+    metrics = face.glyph.metrics
+
+    # FreeType returns 26.6 fixed-point in `metrics`; advance / bearings
+    # in 1/64 px. We're rendered at HIGH_RES so this is already in
+    # high-res-pixel units (FT_Set_Pixel_Sizes(HIGH_RES)).
+    advance_px = face.glyph.advance.x / 64.0
+    bearing_x = metrics.horiBearingX / 64.0
+    bearing_y = metrics.horiBearingY / 64.0
+
+    if bm.width == 0 or bm.rows == 0:
+        # Whitespace / non-renderable glyph; still record advance so the
+        # layout pass can move the pen forward.
+        return None, {
+            "width": 0,
+            "height": 0,
+            "advance": advance_px,
+            "bearing_x": bearing_x,
+            "bearing_y": bearing_y,
+        }
+
+    # Copy the freetype buffer into a numpy array. `pitch` may differ
+    # from `width` (rows can be padded); slice to the actual width.
+    pitch = bm.pitch
+    raw = np.frombuffer(bytes(bm.buffer), dtype=np.uint8).reshape(bm.rows, pitch)
+    img = raw[:, : bm.width].copy()
+
+    return img, {
+        "width": bm.width,
+        "height": bm.rows,
+        "advance": advance_px,
+        "bearing_x": bearing_x,
+        "bearing_y": bearing_y,
+    }
+
+
+def build_sdf(glyph: np.ndarray) -> np.ndarray:
+    """Compute a downsampled SDF tile for a high-res glyph bitmap.
+
+    Args:
+      glyph: HxW uint8, glyph in white.
+
+    Returns:
+      tile: (H/DOWNSAMPLE + 2*PAD) × (W/DOWNSAMPLE + 2*PAD) uint8 SDF.
+            127 = on-edge, >127 = inside, <127 = outside, with
+            SDF_SPREAD high-res pixels mapping to 128/256 of the
+            output range.
+    """
+    # Pad the high-res glyph by SDF_SPREAD pixels in every direction so
+    # the distance transform sees the field outside the glyph.
+    pad_hires = SDF_SPREAD
+    h, w = glyph.shape
+    padded = np.zeros((h + 2 * pad_hires, w + 2 * pad_hires), dtype=np.uint8)
+    padded[pad_hires : pad_hires + h, pad_hires : pad_hires + w] = glyph
+
+    # Threshold to binary inside/outside. The freetype bitmap is
+    # anti-aliased; we want a clean inside-mask for the EDT.
+    inside = padded > 127
+
+    # Two distance fields: distance from outside-pixels to nearest
+    # inside-pixel, and vice versa. Their difference is the SDF.
+    # Standard font-SDF convention is +inside / -outside (so the shader
+    # treats `sdf > 0.5` as "inside the glyph"); we follow that here.
+    d_outside = distance_transform_edt(~inside)
+    d_inside = distance_transform_edt(inside)
+    sdf_hires = d_inside - d_outside  # +inside, -outside
+
+    # Clamp to [-SDF_SPREAD, +SDF_SPREAD] and remap to [0, 255] with
+    # 127 = on-edge, 255 = deep interior, 0 = far outside. The shader
+    # compares against 127/255 (the zero-distance contour) and uses
+    # smoothstep to anti-alias.
+    clamped = np.clip(sdf_hires, -SDF_SPREAD, SDF_SPREAD)
+    normalised = (clamped / SDF_SPREAD * 0.5 + 0.5) * 255.0
+    sdf_u8 = np.clip(normalised, 0, 255).astype(np.uint8)
+
+    # Downsample. PIL handles the bilinear/box average for us, and
+    # produces a clean smaller field.
+    img = Image.fromarray(sdf_u8, mode="L")
+    new_w = max(1, sdf_u8.shape[1] // DOWNSAMPLE)
+    new_h = max(1, sdf_u8.shape[0] // DOWNSAMPLE)
+    img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+    return np.asarray(img, dtype=np.uint8)
+
+
+def shelf_pack(tiles: dict[str, np.ndarray]) -> dict[str, tuple[int, int]]:
+    """Place every tile on the ATLAS_SIZE × ATLAS_SIZE atlas using a
+    simple shelf algorithm. Returns char → (x, y) atlas positions.
+
+    Tiles are sorted tallest-first so each shelf's height is set by its
+    first tile and short tiles after it pack tightly.
+    """
+    items = sorted(tiles.items(), key=lambda kv: -kv[1].shape[0])
+    placements: dict[str, tuple[int, int]] = {}
+    shelf_x = 0
+    shelf_y = 0
+    shelf_h = 0
+    for ch, tile in items:
+        th, tw = tile.shape
+        if shelf_x + tw + PAD > ATLAS_SIZE:
+            # New shelf.
+            shelf_y += shelf_h + PAD
+            shelf_x = 0
+            shelf_h = 0
+        if shelf_y + th + PAD > ATLAS_SIZE:
+            raise RuntimeError(
+                f"atlas overflow at glyph {ch!r}: shelf_y={shelf_y} + th={th} > {ATLAS_SIZE}. "
+                f"Consider raising ATLAS_SIZE or DOWNSAMPLE."
+            )
+        placements[ch] = (shelf_x, shelf_y)
+        shelf_x += tw + PAD
+        shelf_h = max(shelf_h, th)
+    return placements
+
+
+def main() -> int:
+    print("==> generating SDF glyph atlas")
+    font_path = ensure_font()
+
+    face = freetype.Face(str(font_path))
+    face.set_pixel_sizes(0, HIGH_RES)
+
+    em = HIGH_RES  # one EM = HIGH_RES px after the call above
+    ascent = face.size.ascender / 64.0
+    descent = face.size.descender / 64.0  # negative below baseline
+    line_gap = (face.size.height / 64.0) - (ascent - descent)
+
+    # Render every char. `tiles` maps ch → SDF tile (atlas units);
+    # `metrics` keeps the high-res-pixel metrics, converted to EM
+    # fractions when serialising.
+    tiles: dict[str, np.ndarray] = {}
+    metrics: dict[str, dict] = {}
+    skipped: list[str] = []
+    for ch in CHARSET:
+        glyph, m = render_glyph(face, ch)
+        if not m:
+            skipped.append(ch)
+            continue
+        if glyph is None:
+            # whitespace / blank — record metrics but no tile.
+            metrics[ch] = m
+            continue
+        tile = build_sdf(glyph)
+        tiles[ch] = tile
+        metrics[ch] = m
+
+    if skipped:
+        print(f"  skipped (no glyph in font): {''.join(skipped)!r}")
+
+    # Pack tiles onto the atlas.
+    atlas = np.zeros((ATLAS_SIZE, ATLAS_SIZE), dtype=np.uint8)
+    placements = shelf_pack(tiles)
+    for ch, tile in tiles.items():
+        x, y = placements[ch]
+        h, w = tile.shape
+        atlas[y : y + h, x : x + w] = tile
+
+    # Save as RGBA8 (R = SDF, A = 255). The Rust side uploads as
+    # `Rgba8Unorm` and the shader samples R only; carrying it in the
+    # red channel keeps the file viewer-friendly (channel-mixed grey).
+    rgba = np.zeros((ATLAS_SIZE, ATLAS_SIZE, 4), dtype=np.uint8)
+    rgba[..., 0] = atlas
+    rgba[..., 1] = atlas
+    rgba[..., 2] = atlas
+    rgba[..., 3] = 255
+    Image.fromarray(rgba, mode="RGBA").save(ATLAS_PNG, optimize=True)
+
+    # Build the JSON metrics. Dimensions in EM-fractions so the Rust
+    # side can scale by a single `font_size_world_km` constant.
+    glyph_meta: dict[str, dict] = {}
+    for ch, m in metrics.items():
+        x, y = placements.get(ch, (0, 0))
+        if ch in tiles:
+            tile_h, tile_w = tiles[ch].shape
+        else:
+            tile_h = tile_w = 0
+        glyph_meta[ch] = {
+            "atlas_xywh": [int(x), int(y), int(tile_w), int(tile_h)],
+            # Width/height of the *original glyph* (without SDF spread)
+            # in EM units. The Rust side uses these to size the quad;
+            # the SDF spread is added inside the shader so the
+            # anti-aliased halo doesn't shift the glyph's centre.
+            "size_em": [m["width"] / em, m["height"] / em],
+            # Bearing: how far to shift the glyph from the pen position
+            # to its top-left corner (positive bearing_y is up).
+            "bearing_em": [m["bearing_x"] / em, m["bearing_y"] / em],
+            # Pen advance after this glyph, in EM units.
+            "advance_em": m["advance"] / em,
+        }
+
+    out = {
+        "atlas_size": ATLAS_SIZE,
+        "high_res": HIGH_RES,
+        "downsample": DOWNSAMPLE,
+        "sdf_spread_em": SDF_SPREAD / em,
+        # Tile-pixels-per-EM conversion; the layout side multiplies
+        # quad dimensions by `font_size_world / em_per_atlas_px` to
+        # turn atlas px into world km.
+        "em_per_atlas_px": DOWNSAMPLE / em,
+        "ascent_em": ascent / em,
+        "descent_em": descent / em,
+        "line_gap_em": line_gap / em,
+        "font": "IM Fell English (Regular)",
+        "license": "SIL Open Font License 1.1 — see ofl/imfellenglish/OFL.txt",
+        "glyphs": glyph_meta,
+    }
+    ATLAS_JSON.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n")
+
+    print(f"  wrote {ATLAS_PNG} ({ATLAS_SIZE}x{ATLAS_SIZE})")
+    print(f"  wrote {ATLAS_JSON} ({len(glyph_meta)} glyphs)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -7,11 +7,15 @@ edition = "2024"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-eu4-math = { path = "../math" }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
+# `cities.json` is small enough that pulling in serde_json (≈50-100 KB
+# extra wasm) is fine. The alternative — a hand-rolled parser or a custom
+# binary format — isn't worth the maintenance.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # `webgl` is a wasm32-only feature that compiles in the WebGL2 backend (wgpu-core +
 # wgpu-hal/gles). The default `gles` feature only applies to native Linux/Windows/Android/
 # Emscripten, NOT browser wasm — a footgun.
@@ -25,7 +29,20 @@ web-sys = { version = "0.3", features = [
     "Window",
     "Document",
     "Element",
+    # `HtmlElement` lets us mutate `.style` for inline colour swatches and
+    # dispatch click handlers on UI buttons. `DomTokenList` is what
+    # `Element::class_list()` returns — needed to add/remove the
+    # `visible` class on the city panel.
+    "HtmlElement",
+    "DomTokenList",
+    "CssStyleDeclaration",
     "HtmlCanvasElement",
+    # Drawing realm names into an offscreen 2D canvas and reading the pixels
+    # back so we can upload them as a GPU texture (see `crate::labels`).
+    "CanvasRenderingContext2d",
+    "ImageData",
+    # `ctx.measure_text(name)` for fitting the font size to each realm's bbox.
+    "TextMetrics",
     "KeyboardEvent",
     "MouseEvent",
     "WheelEvent",

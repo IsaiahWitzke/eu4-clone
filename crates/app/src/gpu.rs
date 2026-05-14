@@ -52,10 +52,19 @@ impl GpuContext {
             .into(),
         );
 
+        // Opportunistically request `TIMESTAMP_QUERY` so the
+        // `gpu_timing` module can record per-pass GPU times. Adapters
+        // that don't expose the feature (notably the WebGL2 fallback)
+        // get the empty feature set and timing falls back to disabled.
+        let mut required_features = wgpu::Features::empty();
+        if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("eu4-app device"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits::downlevel_webgl2_defaults()
                     .using_resolution(adapter.limits()),
                 experimental_features: wgpu::ExperimentalFeatures::default(),

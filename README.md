@@ -1,9 +1,6 @@
 # eu4-clone
 
-Hacking on a deterministic, browser-based grand-strategy renderer in Rust + wgpu.
-Currently a multi-pass terrain renderer ported from the
-[Advanced Terrain Erosion Filter](https://www.shadertoy.com/view/sf23W1) Shadertoy,
-with real heightmap data of central Europe loaded from public DEM tiles.
+Grand-strategy renderer in Rust + wgpu, running in the browser via wasm.
 
 ## Running
 
@@ -21,31 +18,6 @@ cargo install wasm-bindgen-cli  # install whatever version Cargo.lock says
 # Build + serve
 ./script/build-wasm
 ./script/serve   # http://127.0.0.1:8091
-```
-
-Open the page and you should see a top-down rendered chunk of the Alps.
-
-## Layout
-
-```
-crates/
-  math/    Deterministic fixed-point arithmetic (Fixed)
-  app/     The wasm crate: wgpu render pipeline + Shadertoy port
-    src/
-      lib.rs           Setup, render loop, input handling
-      shaders/
-        common.wgsl    Shared uniforms + fullscreen vs
-        noise.wgsl     hash() + gradient noise
-        base_heightmap.wgsl  Source heightmap (procedural bump or PNG sample)
-        terrain.wgsl   Erosion filter on top of the base heightmap
-        detail_noise.wgsl  Surface detail noise
-        image.wgsl     Raymarched terrain rendering
-    assets/
-      heightmap.png    8192² 16-bit elevation, central Europe (Mapzen Terrarium tiles)
-      water_mask.png   8192² 8-bit water mask (Natural Earth)
-script/
-  build-wasm  Compile + bundle into ./dist
-  serve       python3 -m http.server bound to 127.0.0.1
 ```
 
 ## Third-party content

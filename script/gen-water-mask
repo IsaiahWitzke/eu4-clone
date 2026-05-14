@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""
+Generate `crates/app/assets/water_mask.png` \u2014 a binary R8 mask where
+every pixel covered by a Natural Earth ocean, lake, or European lake
+polygon is 255, everything else is 0.
+
+Pipeline:
+  1. Burn each pre-reprojected (EPSG:3857) Natural Earth shapefile into
+     the same `WORLD_TEX_SIZE`\u00b2 GeoTIFF at value 255. `gdal_rasterize`
+     with `-init 0 -burn 255` and the `-ts` / `-te` flags handles bbox
+     extent + size in one call; subsequent calls write into the same
+     raster without zeroing it.
+  2. Convert to a tightly-encoded R8 PNG.
+
+We previously used a single-pass `unary_union` in shapely to merge all
+three layers, but `gdal_rasterize` accumulating burns gives the same
+result with no Python geometry ops.
+"""
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _world import ASSETS_DIR, WORLD_BBOX, WORLD_TEX_SIZE  # noqa: E402
+
+NE_DIR = ASSETS_DIR / "natural_earth"
+WATER_TIF = ASSETS_DIR / "water_mask.tif"
+WATER_PNG = ASSETS_DIR / "water_mask.png"
+
+# Natural Earth shapefiles (already reprojected to 3857 in this repo).
+LAYERS = [
+    NE_DIR / "ne_10m_ocean_3857.shp",
+    NE_DIR / "ne_10m_lakes_3857.shp",
+    NE_DIR / "ne_10m_lakes_europe_3857.shp",
+]
+
+
+def main():
+    t0 = time.time()
+    for p in LAYERS:
+        if not p.exists():
+            sys.exit(f"missing {p}")
+
+    if WATER_TIF.exists():
+        WATER_TIF.unlink()
+
+    xmin, ymin, xmax, ymax = WORLD_BBOX
+    print(f"Rasterizing water mask \u2192 {WATER_TIF.name} ({WORLD_TEX_SIZE}\u00b2)")
+
+    # First call creates the raster initialised to 0; subsequent calls burn
+    # into the existing raster (so they OR-accumulate the polygon coverage).
+    # `-ot` / `-ts` / `-te` / `-of` only apply when *creating* a new raster;
+    # the update calls just specify burn value and the existing dataset.
+    for i, shp in enumerate(LAYERS):
+        cmd = ["gdal_rasterize", "-burn", "255"]
+        if i == 0:
+            cmd += [
+                "-ot", "Byte",
+                "-init", "0",
+                "-te", str(xmin), str(ymin), str(xmax), str(ymax),
+                "-ts", str(WORLD_TEX_SIZE), str(WORLD_TEX_SIZE),
+                "-of", "GTiff",
+            ]
+        cmd += [str(shp), str(WATER_TIF)]
+        subprocess.check_call(cmd)
+        print(f"  burned {shp.name}")
+
+    print(f"Encoding \u2192 {WATER_PNG.name} (R8)")
+    arr = np.asarray(Image.open(WATER_TIF), dtype=np.uint8)
+    if arr.shape != (WORLD_TEX_SIZE, WORLD_TEX_SIZE):
+        sys.exit(f"unexpected raster shape {arr.shape}")
+    nz = int((arr > 127).sum())
+    print(f"  {nz} water pixels ({nz / arr.size:.1%})")
+    Image.fromarray(arr, mode="L").save(WATER_PNG, optimize=True)
+    print(f"  wrote {WATER_PNG} ({WATER_PNG.stat().st_size / 1024:.1f} KiB)")
+    print(f"done in {time.time() - t0:.1f}s")
+
+
+if __name__ == "__main__":
+    main()

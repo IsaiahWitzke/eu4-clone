@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""
+Generate `crates/app/assets/cities.json` from Natural Earth's
+`populated_places` dataset \u2014 a global list of named cities with
+population data.
+
+Why not Wikidata SPARQL? We tried that first to get strictly
+"established before 1200 AD" filtering. The endpoint kept timing out
+on spatial queries, even with tiny tiles. NE populated_places is a
+pragmatic stand-in: anything with significant modern population (say
+50k+) almost certainly existed in some form by 1200 AD, since cities
+don't appear out of nowhere. Imperfect (Manchester / Detroit / etc.
+get included even though they industrialised much later) but workable
+\u2014 a hand-curated list can replace this later if needed.
+
+Pipeline:
+  1. Download NE 10m populated_places shapefile if missing (~1 MB).
+  2. ogr2ogr-clip + reproject + filter by population to a small
+     intermediate shapefile.
+  3. Convert to GeoJSON, parse out (name, country, lat/lng, pop).
+  4. Reproject to EPSG:3857 (mercator) and to world-km (mercator
+     metres minus bbox centre / 1000) so the renderer can drop
+     entries straight into a vec2 buffer.
+  5. Save JSON.
+
+Tunables at top.
+"""
+import json
+import math
+import subprocess
+import sys
+import time
+import urllib.request
+import zipfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _world import ASSETS_DIR, WORLD_BBOX  # noqa: E402
+
+# Filter: only places with at least this much modern population. 50k is a
+# reasonable "important enough to plausibly have existed in 1200" bar; bump
+# to 100k for a thinner / more global-capital list, or down to 10k to
+# include almost every European market town.
+MIN_POPULATION = 50_000
+
+NE_DIR = ASSETS_DIR / "natural_earth"
+NE_URL = "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_populated_places.zip"
+NE_ZIP = NE_DIR / "ne_10m_populated_places.zip"
+NE_SHP = NE_DIR / "ne_10m_populated_places.shp"
+TMP_DIR = ASSETS_DIR / "_cities_tmp"
+OUT_PATH = ASSETS_DIR / "cities.json"
+
+MERC_R = 6378137.0
+
+
+def lat_lng_to_merc(lat: float, lng: float) -> tuple[float, float]:
+    x = lng * (math.pi / 180.0) * MERC_R
+    y = math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)) * MERC_R
+    return x, y
+
+
+def download_if_missing():
+    if NE_SHP.exists():
+        return
+    NE_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading {NE_URL}...")
+    urllib.request.urlretrieve(NE_URL, NE_ZIP)
+    print(f"  saved {NE_ZIP.stat().st_size / 1024:.0f} KiB \u2192 extracting")
+    with zipfile.ZipFile(NE_ZIP) as z:
+        z.extractall(NE_DIR)
+
+
+def main():
+    if not NE_SHP.exists():
+        download_if_missing()
+
+    t0 = time.time()
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    out_geojson = TMP_DIR / "cities.geojson"
+    if out_geojson.exists():
+        out_geojson.unlink()
+
+    # Convert NE 10m populated_places \u2192 GeoJSON, projected to 3857, clipped
+    # to bbox, filtered by min population. We keep the source CRS as 4326
+    # (NE default) for the lat/lng fields, and let ogr2ogr handle the
+    # spatial clip + project.
+    xmin, ymin, xmax, ymax = WORLD_BBOX
+    print(
+        f"Filtering populated_places (pop \u2265 {MIN_POPULATION:,}, "
+        f"bbox EPSG:3857) \u2192 GeoJSON"
+    )
+    subprocess.check_call([
+        "ogr2ogr",
+        "-f", "GeoJSON",
+        "-t_srs", "EPSG:3857",
+        "-clipdst", str(xmin), str(ymin), str(xmax), str(ymax),
+        "-sql",
+        # Pull a small set of useful columns. POP_MAX is the curated
+        # "best-known" max population; LATITUDE / LONGITUDE are in WGS-84.
+        "SELECT NAME, ADM0NAME AS country, LATITUDE AS lat, LONGITUDE AS lng, "
+        "POP_MAX AS pop "
+        f"FROM \"{NE_SHP.stem}\" "
+        f"WHERE POP_MAX >= {MIN_POPULATION}",
+        str(out_geojson),
+        str(NE_SHP),
+    ])
+    print(f"  wrote {out_geojson.name}")
+
+    print("Parsing + reprojecting...")
+    raw = json.loads(out_geojson.read_text())
+    cities = []
+    for feat in raw["features"]:
+        props = feat["properties"]
+        name = props.get("NAME") or props.get("name") or "?"
+        country = props.get("country") or props.get("ADM0NAME") or "?"
+        # ogr2ogr uppercases unquoted aliases, so check both cases.
+        lat = props.get("lat", props.get("LAT"))
+        lng = props.get("lng", props.get("LNG"))
+        pop = props.get("pop", props.get("POP"))
+        try:
+            pop = int(float(pop)) if pop is not None else None
+        except (ValueError, TypeError):
+            pop = None
+        if lat is None or lng is None:
+            continue
+
+        merc_x, merc_y = lat_lng_to_merc(float(lat), float(lng))
+        cities.append({
+            "name": name,
+            "country": country,
+            "lat": round(float(lat), 6),
+            "lng": round(float(lng), 6),
+            "merc_x": round(merc_x, 1),
+            "merc_y": round(merc_y, 1),
+            # World units are km, centred on the bbox \u2014 drop straight
+            # into a vec2 in renderer space.
+            "world_x_km": round(
+                (merc_x - 0.5 * (xmin + xmax)) / 1000.0, 3
+            ),
+            "world_z_km": round(
+                (merc_y - 0.5 * (ymin + ymax)) / 1000.0, 3
+            ),
+            "modern_population": pop,
+        })
+
+    cities.sort(key=lambda c: -(c["modern_population"] or 0))
+    print(f"  {len(cities)} cities within bbox + pop \u2265 {MIN_POPULATION:,}")
+
+    out = {
+        "version": 1,
+        "source": (
+            "Natural Earth 10m populated_places, filtered to bbox + "
+            f"POP_MAX \u2265 {MIN_POPULATION}"
+        ),
+        "bbox_epsg3857": list(WORLD_BBOX),
+        "min_population": MIN_POPULATION,
+        "count": len(cities),
+        "cities": cities,
+    }
+    OUT_PATH.write_text(json.dumps(out, ensure_ascii=False, indent=1))
+    print(f"  wrote {OUT_PATH} ({OUT_PATH.stat().st_size / 1024:.1f} KiB)")
+
+    # Quick eyeball summary.
+    print("\nTop 15 by modern population:")
+    for c in cities[:15]:
+        pop = c["modern_population"] or 0
+        print(
+            f"  {pop:>11,}  {c['name']:<28}  ({c['country']})  "
+            f"({c['lat']:6.2f}, {c['lng']:7.2f})"
+        )
+
+    print(f"\ndone in {time.time() - t0:.1f}s")
+
+
+if __name__ == "__main__":
+    main()

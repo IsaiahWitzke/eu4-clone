@@ -1,0 +1,9 @@
+* 2024-06-04 Added CNTR 2024 and NUTS 2024
+* 2024-07-23 added gpkg format
+* 2024-09-10 NUTS 2024: UA available only at level 0; minor fixes.
+* 2024-10-02 NUTS 2024: BN fixes
+* 2024-10-09 All datasets: fixed encoding of multilingual shapefile attributes
+* 2025-02-26 fixed countries 2024 and NUTS 2024: a few mis-assigned islands in the Pacific 
+* 2025-03-11 made Türkiye boundaries using OSM data, added Bosnia and Herzegovina to NUTS level 2
+* 2025-04-03 ﻿fixed duplicate HR records
+* 2026-04-21 ﻿NUTS 2024 60M: minor correction in bosnia

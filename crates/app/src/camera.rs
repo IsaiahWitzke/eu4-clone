@@ -23,14 +23,15 @@ pub const CAMERA_TARGET_Y: f32 = 4.0;
 /// at default 15.5° tilt, max worst-case error is ~10 km on 4 km peaks.
 pub const HOVER_PICK_Y: f32 = 3.0;
 
-// World units = km, so distances are in km. Defaults give a country-scale
-// overview of Switzerland; min/max bracket close-up alpine views to nearly
-// stratospheric.
-pub const DEFAULT_CAMERA_DISTANCE: f32 = 300.0;
+// World units = km, so distances are in km. The world is now ~5500 km
+// wide (Western/Central Europe in mercator units), so the default zoom
+// shows a wide regional view; max distance is enough to fit the entire
+// world on screen, min keeps single-village zooms reachable.
+pub const DEFAULT_CAMERA_DISTANCE: f32 = 3000.0;
 pub const DEFAULT_CAMERA_TILT: f32 = 0.27;
 
 pub const MIN_CAMERA_DISTANCE: f32 = 5.0;
-pub const MAX_CAMERA_DISTANCE: f32 = 1500.0;
+pub const MAX_CAMERA_DISTANCE: f32 = 8000.0;
 pub const MIN_CAMERA_TILT: f32 = 0.0;
 pub const MAX_CAMERA_TILT: f32 = std::f32::consts::FRAC_PI_2 - 0.05;
 
@@ -113,10 +114,16 @@ pub struct Camera {
     pub distance: f32,
     pub tilt: f32,
     pub map_mode: MapMode,
-    /// Currently-hovered province ID, or 0 = nothing hovered. Updated by the
-    /// renderer's mouse-pick path; consumed by the shader to draw a
-    /// highlight overlay on the matching province.
+    /// Currently-hovered realm ID encoded as `realm_id + 1` (so 0 means
+    /// "nothing hovered"). Drives the realm-wide hover wash. The name
+    /// `_pid` is historical — originally a province ID; now it carries the
+    /// influence-field's dominant realm.
     pub hovered_pid: u32,
+    /// Currently-hovered settlement encoded as `settlement_index + 1`
+    /// (0 = nothing). Drives the *hinterland* hover wash — a stronger
+    /// highlight on just the cells dominated by the same city the cursor
+    /// is over, layered on top of the realm-wide wash.
+    pub hovered_city: u32,
 }
 
 impl Camera {
@@ -127,6 +134,7 @@ impl Camera {
             tilt: DEFAULT_CAMERA_TILT,
             map_mode: MapMode::default(),
             hovered_pid: 0,
+            hovered_city: 0,
         }
     }
 
@@ -238,6 +246,71 @@ impl Camera {
         Some([eye[0] + rd[0] * t, eye[2] + rd[2] * t])
     }
 
+    /// Project a world point at (xz, y) to a screen-space CSS-pixel
+    /// position. Inverse of [`pick_world_xz`]: takes a 3D world point
+    /// and returns where on the canvas it lands. Returns `None` if the
+    /// point is behind the camera (or numerically unstable).
+    ///
+    /// Used by the HTML overlay to position country labels at each
+    /// realm's centroid every frame. Same camera basis as
+    /// `pick_world_xz` so the two stay in sync; if you tweak one,
+    /// tweak the other.
+    pub fn project_world_xz(
+        &self,
+        p_xz: [f32; 2],
+        y: f32,
+        css_w: f32,
+        css_h: f32,
+    ) -> Option<[f32; 2]> {
+        let look_at = [
+            self.world_center[0],
+            CAMERA_TARGET_Y,
+            self.world_center[1],
+        ];
+        let off = self.eye_offset();
+        let eye = [
+            look_at[0] + off[0],
+            look_at[1] + off[1],
+            look_at[2] + off[2],
+        ];
+
+        let forward = normalize3([
+            look_at[0] - eye[0],
+            look_at[1] - eye[1],
+            look_at[2] - eye[2],
+        ]);
+        let world_up = [0.0_f32, 1.0, 0.0];
+        let right = normalize3(cross3(world_up, forward));
+        let up = cross3(forward, right);
+
+        // Vector from camera to the world point, decomposed along
+        // (right, up, forward). `depth` is how far in front of the
+        // camera the point is; (right, up) components / depth give
+        // tan-space NDC.
+        let v = [p_xz[0] - eye[0], y - eye[1], p_xz[1] - eye[2]];
+        let depth = dot3(v, forward);
+        if depth <= 1e-3 {
+            return None;
+        }
+
+        let aspect = css_w / css_h.max(1.0);
+        let tan_half_y = (CAMERA_FOV_Y_RAD * 0.5).tan();
+        let tan_half_x = tan_half_y * aspect;
+
+        let ndc_x = (dot3(v, right) / depth) / tan_half_x;
+        let ndc_y = (dot3(v, up) / depth) / tan_half_y;
+
+        if !ndc_x.is_finite() || !ndc_y.is_finite() {
+            return None;
+        }
+
+        // NDC → screen px. NDC y is +up, screen y is +down (matches
+        // the inverse `ndc_y = 1.0 - my/css_h * 2.0` in pick_world_xz).
+        let mx = (ndc_x + 1.0) * 0.5 * css_w;
+        let my = (1.0 - ndc_y) * 0.5 * css_h;
+        Some([mx, my])
+    }
+
     /// Build the GPU uniform block for the image pass.
     pub fn to_uniforms(&self, width: u32, height: u32) -> CameraUniforms {
         CameraUniforms {
@@ -245,7 +318,7 @@ impl Camera {
             i_time: 0.0,
             world_center: self.world_center,
             hovered_pid: self.hovered_pid,
-            _pad0: 0,
+            hovered_city: self.hovered_city,
             eye_offset: self.eye_offset(),
             map_mode: self.map_mode as u32,
         }
@@ -264,6 +337,9 @@ fn normalize3(v: [f32; 3]) -> [f32; 3] {
     let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-20);
     [v[0] / len, v[1] / len, v[2] / len]
 }
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
 
 impl Default for Camera {
     fn default() -> Self {
@@ -274,8 +350,8 @@ impl Default for Camera {
 // ---- GPU uniform block ---------------------------------------------------
 
 /// Mirrors the WGSL `Uniforms` struct in `shaders/camera.wgsl`. Layout:
-/// vec3 (16-byte aligned), trailing f32, vec2, then `hovered_pid` + pad
-/// occupying what used to be `_pad0`'s 8 bytes, then vec3 + `map_mode: u32`
+/// vec3 (16-byte aligned), trailing f32, vec2, then `hovered_pid` and
+/// `hovered_city` filling the next 8 bytes, then vec3 + `map_mode: u32`
 /// in the vec3's trailing pad. 48 bytes total.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -283,10 +359,12 @@ pub struct CameraUniforms {
     pub i_resolution: [f32; 3],
     pub i_time: f32,
     pub world_center: [f32; 2],
-    /// Currently-hovered province ID (0 = none). Set on the Rust side from
-    /// the latest mouse position.
+    /// Currently-hovered realm encoded as `realm_id + 1` (0 = none).
     pub hovered_pid: u32,
-    pub _pad0: u32,
+    /// Currently-hovered settlement encoded as `settlement_index + 1`
+    /// (0 = none). Used by the shader to draw a hinterland highlight on
+    /// top of the realm-wide hover wash.
+    pub hovered_city: u32,
     pub eye_offset: [f32; 3],
     /// Mirrors `MapMode` discriminants. Stored as `u32` so the shader can
     /// branch directly on it without a float→int conversion.

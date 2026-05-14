@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""
+Download a list of European cities/towns/settlements that existed before
+1201 AD from Wikidata, project to EPSG:3857, and save to
+`crates/app/assets/medieval_cities.json`.
+
+Each output entry has the original lat/lng (WGS-84), the projected
+mercator (EPSG:3857) coordinates, the inception year, country name, and
+a few other useful tags. The renderer can load this JSON, drop the
+mercator coords into vec2s, and place markers wherever it likes.
+
+Pipeline:
+  1. Build a SPARQL query that finds every Wikidata entity that's an
+     instance/subclass of `human settlement` (Q486972), has coordinates
+     (P625), has an inception date (P571), and was established before
+     1201-01-01. We restrict to a slightly-padded version of WORLD_BBOX
+     (in lat/lng) via `SERVICE wikibase:box` so the query stays fast.
+  2. Hit the public SPARQL endpoint
+     (https://query.wikidata.org/sparql), parse the JSON response.
+  3. Convert each result's `Point(lng lat)` WKT literal into floats,
+     reproject to mercator, drop ones outside `WORLD_BBOX`.
+  4. Save the structured list to JSON.
+
+Wikidata's coverage is excellent for major medieval cities (Paris,
+Constantinople, Cordoba, Venice, etc.) but spotty for tiny villages \u2014
+many small medieval towns lack an inception date in Wikidata. Expect
+500-3000 results.
+"""
+import json
+import math
+import re
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _world import ASSETS_DIR, WORLD_BBOX  # noqa: E402
+
+OUT_PATH = ASSETS_DIR / "medieval_cities.json"
+SPARQL_URL = "https://query.wikidata.org/sparql"
+USER_AGENT = "eu4-clone-asset-pipeline/1.0 (research; no scraping)"
+MERC_R = 6378137.0  # Web-Mercator radius
+
+# Inclusive cutoff. Things existing on or before this date count.
+CUTOFF_YEAR = 1200
+
+# Pad the lat/lng bbox by ~3° so coastal cities right at the edge of our
+# mercator bbox aren't excluded by Wikidata before we re-filter. We'll
+# tighten back to WORLD_BBOX in mercator units after fetching.
+LAT_LNG_BBOX_PAD = 3.0
+
+# Tile the bbox into a GRID_W × GRID_H lat/lng grid and run one SPARQL
+# query per tile. Each tile ends up roughly 275 km × 275 km — small
+# enough that the per-tile result count is a few dozen and Wikidata
+# answers in well under 10 s.
+GRID_W = 20
+GRID_H = 16
+
+# Per-request HTTP timeout. Tiles this small should comfortably
+# answer in well under this limit; tail-latency tolerance only.
+REQUEST_TIMEOUT = 30
+
+# Wikidata classes considered "city-like". One per UNION branch in the
+# query — we keep the list short because every type pulls a separate
+# join inside Wikidata's planner. Q515 (city) catches almost everything
+# medieval; the others mop up edge cases. Anything missing here can be
+# added by the user without restructuring.
+CITY_CLASSES = [
+    "Q515",      # city
+    "Q3957",     # town
+    "Q5119",     # capital city
+]
+
+
+def build_query(sw_lng, sw_lat, ne_lng, ne_lat, cutoff_iso):
+    """
+    Minimal-cost spatial query. We deliberately strip out OPTIONAL
+    joins, label service, and country / population enrichments — those
+    cost more than the spatial filter itself in Wikidata's planner and
+    were what caused the original full-bbox query to time out. Labels
+    get backfilled by `fetch_labels()` in a second batched pass.
+    """
+    values_clause = " ".join(f"wd:{c}" for c in CITY_CLASSES)
+    return f"""
+SELECT ?place ?coords ?inception WHERE {{
+  SERVICE wikibase:box {{
+    ?place wdt:P625 ?coords .
+    bd:serviceParam wikibase:cornerSouthWest "Point({sw_lng} {sw_lat})"^^geo:wktLiteral .
+    bd:serviceParam wikibase:cornerNorthEast "Point({ne_lng} {ne_lat})"^^geo:wktLiteral .
+  }}
+  VALUES ?type {{ {values_clause} }}
+  ?place wdt:P31 ?type ;
+         wdt:P571 ?inception .
+  FILTER(?inception < "{cutoff_iso}"^^xsd:dateTime)
+}}
+"""
+
+
+LABEL_QUERY = """
+SELECT ?place ?placeLabel ?countryLabel ?pop WHERE {{
+  VALUES ?place {{ {qid_block} }}
+  OPTIONAL {{ ?place wdt:P17 ?country }}
+  OPTIONAL {{ ?place wdt:P1082 ?pop }}
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" }}
+}}
+"""
+
+
+def merc_to_lat_lng(x: float, y: float) -> tuple[float, float]:
+    lng = x / MERC_R * (180.0 / math.pi)
+    lat = math.degrees(2.0 * math.atan(math.exp(y / MERC_R)) - math.pi / 2)
+    return lat, lng
+
+
+def lat_lng_to_merc(lat: float, lng: float) -> tuple[float, float]:
+    x = lng * (math.pi / 180.0) * MERC_R
+    y = math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)) * MERC_R
+    return x, y
+
+
+def make_grid():
+    """Yield (sw_lng, sw_lat, ne_lng, ne_lat) tile bboxes in lat/lng."""
+    xmin, ymin, xmax, ymax = WORLD_BBOX
+    sw_lat, sw_lng = merc_to_lat_lng(xmin, ymin)
+    ne_lat, ne_lng = merc_to_lat_lng(xmax, ymax)
+    sw_lat -= LAT_LNG_BBOX_PAD
+    sw_lng -= LAT_LNG_BBOX_PAD
+    ne_lat += LAT_LNG_BBOX_PAD
+    ne_lng += LAT_LNG_BBOX_PAD
+    dx = (ne_lng - sw_lng) / GRID_W
+    dy = (ne_lat - sw_lat) / GRID_H
+    for j in range(GRID_H):
+        for i in range(GRID_W):
+            yield (
+                sw_lng + i * dx,
+                sw_lat + j * dy,
+                sw_lng + (i + 1) * dx,
+                sw_lat + (j + 1) * dy,
+            )
+
+
+def fetch(query: str) -> dict:
+    """POST the query (GET fails for queries > a few KB)."""
+    data = urllib.parse.urlencode({"query": query}).encode()
+    req = urllib.request.Request(
+        SPARQL_URL,
+        data=data,
+        headers={
+            "Accept": "application/sparql-results+json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+        return json.loads(resp.read())
+
+
+# WKT "Point(lng lat)" \u2014 lng first.
+_POINT_RE = re.compile(r"Point\(\s*([-+]?\d+\.?\d*)\s+([-+]?\d+\.?\d*)\s*\)")
+
+
+def parse_point(value: str) -> tuple[float, float] | None:
+    m = _POINT_RE.match(value)
+    if not m:
+        return None
+    return float(m.group(1)), float(m.group(2))
+
+
+def parse_inception(value: str) -> int | None:
+    """
+    Wikidata inceptions can look like '1066-01-01T00:00:00Z' (CE) or
+    '-0100-01-01T00:00:00Z' (BCE \u2014 leading '-' indicates negative year).
+    Return the integer year, possibly negative.
+    """
+    if not value:
+        return None
+    sign = -1 if value.startswith("-") else 1
+    body = value.lstrip("-")
+    try:
+        year = int(body.split("-")[0])
+    except (ValueError, IndexError):
+        return None
+    return sign * year
+
+
+def main():
+    t0 = time.time()
+    cutoff_iso = f"{CUTOFF_YEAR + 1:04d}-01-01T00:00:00"
+    tiles = list(make_grid())
+    print(
+        f"Querying Wikidata SPARQL in {GRID_W}\u00d7{GRID_H} = {len(tiles)} tiles "
+        f"(cutoff: {CUTOFF_YEAR + 1}-01-01, types: {len(CITY_CLASSES)} classes)"
+    )
+
+    all_bindings = []
+    failed_tiles = []
+    for idx, (sw_lng, sw_lat, ne_lng, ne_lat) in enumerate(tiles, 1):
+        t_tile = time.time()
+        try:
+            data = fetch(build_query(sw_lng, sw_lat, ne_lng, ne_lat, cutoff_iso))
+            n = len(data["results"]["bindings"])
+            all_bindings.extend(data["results"]["bindings"])
+            print(
+                f"  tile {idx:>3}/{len(tiles)}  "
+                f"lng=[{sw_lng:6.1f},{ne_lng:6.1f}] lat=[{sw_lat:5.1f},{ne_lat:5.1f}]  "
+                f"\u2192 {n:>3} results in {time.time() - t_tile:4.1f}s  "
+                f"(running total: {len(all_bindings)})",
+                flush=True,
+            )
+        except Exception as e:
+            failed_tiles.append((sw_lng, sw_lat, ne_lng, ne_lat))
+            print(
+                f"  tile {idx:>3}/{len(tiles)} FAILED in {time.time() - t_tile:4.1f}s ({e}); continuing",
+                flush=True,
+            )
+    if failed_tiles:
+        print(f"  {len(failed_tiles)} tiles failed; skipping")
+    print(f"Got {len(all_bindings)} raw rows from {len(tiles) - len(failed_tiles)} tiles")
+
+    # Backfill English labels + (optional) country + (optional) population
+    # in batches of 100 QIDs per request — the OPTIONAL clauses are cheap
+    # when the input set is small.
+    print("Fetching labels + metadata for unique QIDs...")
+    qids = sorted({
+        b["place"]["value"].rsplit("/", 1)[-1]
+        for b in all_bindings
+    })
+    print(f"  {len(qids)} unique QIDs")
+    label_lookup = {}
+    BATCH = 100
+    for i in range(0, len(qids), BATCH):
+        chunk = qids[i:i + BATCH]
+        block = " ".join(f"wd:{q}" for q in chunk)
+        t_lbl = time.time()
+        try:
+            data = fetch(LABEL_QUERY.format(qid_block=block))
+            for b in data["results"]["bindings"]:
+                qid = b["place"]["value"].rsplit("/", 1)[-1]
+                label_lookup[qid] = {
+                    "name": b.get("placeLabel", {}).get("value"),
+                    "country": b.get("countryLabel", {}).get("value"),
+                    "pop": b.get("pop", {}).get("value"),
+                }
+            print(
+                f"  batch {i // BATCH + 1}/{(len(qids) + BATCH - 1) // BATCH}  "
+                f"({len(chunk)} qids \u2192 {time.time() - t_lbl:4.1f}s)",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"  batch {i // BATCH + 1} FAILED ({e}); continuing", flush=True)
+
+    xmin, ymin, xmax, ymax = WORLD_BBOX
+    cities = []
+    seen = set()
+    for binding in all_bindings:
+        coords = binding.get("coords", {}).get("value")
+        if not coords:
+            continue
+        pt = parse_point(coords)
+        if not pt:
+            continue
+        lng, lat = pt
+        merc_x, merc_y = lat_lng_to_merc(lat, lng)
+        if not (xmin <= merc_x <= xmax and ymin <= merc_y <= ymax):
+            continue
+
+        qid = binding["place"]["value"].rsplit("/", 1)[-1]
+        meta = label_lookup.get(qid, {})
+        name = meta.get("name") or qid
+        # De-duplicate: same name + nearly-identical coords usually means
+        # Wikidata has a city + city-of-X duplicate row.
+        key = (name, round(lat, 3), round(lng, 3))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        country = meta.get("country")
+        inception_year = parse_inception(binding.get("inception", {}).get("value"))
+        pop = meta.get("pop")
+        try:
+            pop = int(float(pop)) if pop is not None else None
+        except (ValueError, TypeError):
+            pop = None
+
+        cities.append({
+            "name": name,
+            "country": country,
+            "lat": round(lat, 6),
+            "lng": round(lng, 6),
+            "merc_x": round(merc_x, 1),
+            "merc_y": round(merc_y, 1),
+            # World units are km; subtract bbox centre and divide by 1000.
+            # The renderer's world XZ uses (mercator metres - bbox_center) /
+            # 1000, so this matches what its uniforms expect.
+            "world_x_km": round(
+                (merc_x - 0.5 * (xmin + xmax)) / 1000.0, 3
+            ),
+            "world_z_km": round(
+                (merc_y - 0.5 * (ymin + ymax)) / 1000.0, 3
+            ),
+            "inception_year": inception_year,
+            "modern_population": pop,
+        })
+
+    cities.sort(key=lambda c: (
+        c["inception_year"] if c["inception_year"] is not None else 9999,
+        -(c["modern_population"] or 0),
+    ))
+    print(f"  {len(cities)} unique settlements within bbox")
+
+    out = {
+        "version": 1,
+        "source": (
+            "Wikidata SPARQL (P31/P279* = Q486972, has P571 < "
+            f"{CUTOFF_YEAR + 1}-01-01, P625 in bbox)"
+        ),
+        "bbox_epsg3857": list(WORLD_BBOX),
+        "cutoff_year": CUTOFF_YEAR,
+        "count": len(cities),
+        "cities": cities,
+    }
+    OUT_PATH.write_text(json.dumps(out, ensure_ascii=False, indent=1))
+    print(f"  wrote {OUT_PATH} ({OUT_PATH.stat().st_size / 1024:.1f} KiB)")
+
+    # Quick eyeball summary.
+    print("\nFirst 12 (sorted by oldest \u2192 then by population):")
+    for c in cities[:12]:
+        yr = c["inception_year"]
+        yr_str = f"{abs(yr)} {'BC' if yr and yr < 0 else 'AD'}" if yr is not None else "?"
+        pop = c["modern_population"]
+        pop_str = f"{pop:,}" if pop else "-"
+        print(
+            f"  {yr_str:>10}  {c['name']:<30}  "
+            f"({c['lat']:6.2f}, {c['lng']:7.2f})  pop={pop_str}"
+        )
+
+    print(f"\ndone in {time.time() - t0:.1f}s")
+
+
+if __name__ == "__main__":
+    main()

@@ -2,26 +2,24 @@
 # `dist/` is built fresh on every CI run by .github/workflows/static.yml, so
 # we ignore it locally and don't track it in git.
 /dist
-# Project-local Python venv used by `script/gen-border-sdf` etc.
+# Project-local Python venv used by the asset-generation scripts.
 /.venv
 
 # OS / tool junk.
 .DS_Store
 *.aux.xml
+__pycache__/
 
-# Asset generation intermediates. The final, committed assets are
-# `crates/app/assets/heightmap.png` and `crates/app/assets/water_mask.png`;
-# everything else (raw tiles, reprojection products, preview renders) is
-# regeneratable.
+# Asset generation intermediates. The final, committed assets are the PNGs
+# under `crates/app/assets/`; everything else (raw tiles, reprojection
+# products, preview renders, scratch dirs) is regeneratable.
 /crates/app/assets/tiles/
 /crates/app/assets/natural_earth/
 /crates/app/assets/swiss.vrt
 /crates/app/assets/preview.png
-# Raw source data for the categorical masks: NUTS shapefiles (~295MB),
-# WWF / RESOLVE Ecoregions biome data (~375MB). The committed final
-# products are the .png masks; these are regenerable via
-# `script/gen-border-sdf` etc.
-/crates/app/assets/nuts/
+/crates/app/assets/_cities_tmp/
+# Raw source data for the biome mask: WWF / RESOLVE Ecoregions (~375MB).
+# The committed biome_mask.png is the final product.
 /crates/app/assets/wwf/
 # Intermediate .tif rasterizations from gdal_rasterize. The .png assets
 # next to them are the final committed products.

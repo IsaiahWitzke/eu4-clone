@@ -19,14 +19,71 @@
 // textureLoad at integer coords; interpolating between e.g. biome 4 and 12
 // produces fictional 5..11 pixels at borders.
 @group(0) @binding(7) var biome_mask: texture_2d<f32>;
-// Province IDs (16-bit big-endian unsigned, packed into a Rg8Unorm texture
-// with R = high byte, G = low byte). Categorical; sampled with textureLoad.
-@group(0) @binding(8) var province_mask: texture_2d<f32>;
-// Pre-baked border signed-distance-field. Pixel value (R, after unorm → [0,1])
-// encodes `min(distance_to_nearest_border, BORDER_MAX_DIST_PX) / BORDER_MAX_DIST_PX`.
-// Source: `script/gen-border-sdf` (Chaikin-smoothed NUTS-3 boundaries, then
-// Euclidean distance transform). Bilinearly sampled in the shader.
-@group(0) @binding(9) var border_sdf: texture_2d<f32>;
+
+// Settlement influence-field uniform block.
+// `strength * exp(-distance/E_FOLD)` field for its realm; the shader takes
+// the per-pixel argmax (`sample_realm_field`) to decide which realm owns
+// the fragment. Mirrors the Rust `SettlementUniforms` in `settlements.rs`.
+const MAX_SETTLEMENTS: u32 = 1024u;
+struct GpuSettlement {
+    world_xz: vec2<f32>,
+    strength: f32,
+    realm_id: u32,
+}
+struct Settlements {
+    // Three scalar u32 pads (NOT a vec3<u32>) so the array starts at
+    // offset 16. `vec3<u32>` has 16-byte alignment in the uniform
+    // address space, which would force naga to insert 12 bytes of
+    // implicit padding *before* the vec3 — pushing `items` to offset 32
+    // and the buffer size beyond what we want. Three u32 scalars each
+    // have 4-byte alignment so they sit cleanly at offsets 4/8/12, and
+    // `items` lands at 16 to match `SettlementUniforms` in Rust.
+    count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    items: array<GpuSettlement, 1024>,
+}
+@group(0) @binding(10) var<uniform> settlements: Settlements;
+
+// Pre-baked realm influence field. 2048² Rgba16Float over the 5500 km
+// world. The bake pass (`shaders/realm_field.wgsl`) ran the per-pixel
+// argmax-realm loop once at startup (and any time the settlement list
+// changes), so the per-fragment cost here is a single textureLoad
+// instead of the old O(N) loop. Channels:
+//   R: realm_id    (raw f32; f16 exact through 2048)
+//   G: alpha       (saturating fade, 0 wilderness → ≈1 deep interior)
+//   B: contested-1 (clamped to [0, 1]; iso-line at 0)
+//   A: city_idx    (raw f32 of the dominant settlement; powers hover
+//                   hinterland highlighting)
+@group(0) @binding(11) var realm_field_tex: texture_2d<f32>;
+
+// Full-resolution world heightmap (4096² Rg8Unorm covering the whole 5500 km
+// world bbox). 16-bit elevation is split across R+G (big-endian). Sampled by
+// `vs_mesh` so mesh vertices land on the source data's native ~1.34 km/px
+// resolution instead of going through the 1024² cached `terrain` layer
+// (which downsamples by ~5× at default zoom).
+@group(0) @binding(13) var world_heightmap_tex: texture_2d<f32>;
+
+// Reconstruct a [0, 1] normalised elevation from `world_heightmap_tex`'s
+// split-byte encoding. Mirrors `sample_height` in `base_heightmap.wgsl`.
+// Linear filtering of the two bytes is mathematically equivalent to linear
+// filtering of the reconstructed 16-bit value, so bilinear sampling "just
+// works" here.
+//
+// Out-of-bounds → sea level so the mesh's edge column/row, which can sit
+// outside the texture footprint when the camera is at the world bbox edge,
+// doesn't smear whatever happens to be at the edge across the void.
+fn sample_world_height(uv: vec2<f32>) -> f32 {
+    if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))) {
+        return 0.0;
+    }
+    let rg = textureSampleLevel(world_heightmap_tex, samp, uv, 0.0).xy;
+    return (rg.x * 65280.0 + rg.y * 255.0) / 65535.0;
+}
+
+// Binding 12 used to be a Canvas2D-painted country-name overlay; replaced
+// by the in-engine SDF glyph atlas pass (see `passes::realm_labels`).
 
 // ----------------------------------------------------------------------------
 // Constants
@@ -363,62 +420,13 @@ fn biome_known(biome_id: i32) -> bool {
 }
 
 // ----------------------------------------------------------------------------
-// Province lookup. Same world-anchored sampling pattern as the biome mask
-// (textureLoad at integer pixel coords, no filtering), but the value is a
-// 16-bit big-endian unsigned integer split across the R + G channels of an
-// Rg8Unorm texture: `id = R * 256 + G` after rescaling unorm → 0…255.
+// Realm palette.
 //
-// IDs are arbitrary opaque tokens; 0 is reserved for "no province" (water,
-// outside the source shapefile, etc).
-// ----------------------------------------------------------------------------
-fn sample_province_id(world_xz: vec2<f32>) -> u32 {
-    let uv = world_to_world_uv(world_xz);
-    let dim = vec2<f32>(textureDimensions(province_mask));
-    let dim_i = vec2<i32>(dim);
-    let coord = clamp(
-        vec2<i32>(uv * dim),
-        vec2<i32>(0),
-        dim_i - vec2<i32>(1),
-    );
-    let s = textureLoad(province_mask, coord, 0);
-    let hi = u32(round(s.x * 255.0));
-    let lo = u32(round(s.y * 255.0));
-    return hi * 256u + lo;
-}
-
-// Cheap hash → distinct color per opaque integer ID. Saturated values would
-// clash with snow / sun highlights, so we shift into a mid-bright range.
-fn hash_color(id: u32) -> vec3<f32> {
-    let f = f32(id);
-    let r = fract(sin(f * 12.9898) * 43758.5453);
-    let g = fract(sin(f * 78.233)  * 43758.5453);
-    let b = fract(sin(f * 39.346)  * 43758.5453);
-    return vec3<f32>(r, g, b) * 0.55 + 0.35;
-}
-
-fn province_color(id: u32) -> vec3<f32> {
-    return hash_color(id);
-}
-
-// Faked "ownership" / realm assignment: integer-divide the province ID into
-// chunks of `REALM_SIZE`. Province IDs are issued in source-shapefile order
-// (FID + 1), so consecutive IDs aren't strictly geographically clustered but
-// the result is randomised-feeling — each realm covers a handful of provinces.
-//
-// When real ownership data lands later, replace this with a province→owner
-// LUT (e.g. an additional R8 texture indexed by pid) and keep callers using
-// `realm_color(pid)` unchanged.
-const REALM_SIZE: u32 = 7u;
-
-fn realm_id(pid: u32) -> u32 {
-    return pid / REALM_SIZE;
-}
-
 // Curated palette of 16 realm colours. Picked to be distinct across the
 // hue wheel and saturated enough to read against grass / forest /
 // mountain terrain without being garish. Indexed by
-// `realm_id(pid) % REALM_PALETTE_SIZE`. When real ownership data lands,
-// the palette can stay; only the realm → idx mapping changes.
+// `realm_id % REALM_PALETTE_SIZE`.
+// ----------------------------------------------------------------------------
 const REALM_PALETTE_SIZE: u32 = 16u;
 
 fn realm_palette(idx: u32) -> vec3<f32> {
@@ -443,45 +451,164 @@ fn realm_palette(idx: u32) -> vec3<f32> {
     return palette[idx % REALM_PALETTE_SIZE];
 }
 
-fn realm_color(pid: u32) -> vec3<f32> {
-    return realm_palette(realm_id(pid));
-}
-
-// Border SDF parameters. `BORDER_MAX_DIST_PX` must match `MAX_DIST_PX` in
-// `script/gen-border-sdf` — the SDF stores `min(d, MAX_DIST_PX) / MAX_DIST_PX`,
-// so multiplying by it recovers a distance in SDF-texture pixels.
-//
-// CK3-style border styling: each province paints the inward side of its
-// own edges with a soft fade tinted by its realm colour. The fade is a
-// *pulse* — zero on the border line itself, peaks ~PEAK_PX inside, then
-// fades smoothly to zero at FADE_END_PX. Because the pulse goes back to
-// zero at d = 0, two provinces sharing a border end up looking like *two*
-// parallel coloured bands separated by a thin uncoloured line, instead of
-// one bicoloured stripe. Provinces in the same realm share a colour, so
-// within-realm borders disappear visually.
-const BORDER_MAX_DIST_PX: f32     = 48.0;
-const BORDER_PEAK_PX: f32         = 5.0;   // where the colour band peaks (px from edge)
-const BORDER_FADE_END_PX: f32     = 28.0;  // where the fade returns to 0
-const BORDER_TINT_STRENGTH: f32   = 0.65;  // peak mix amount at d = PEAK_PX
-const BORDER_TINT_BRIGHTEN: f32   = 1.4;   // pre-mix brightness boost
-
-// Strength of the soft-light tint applied across the *entire* province
-// interior (in addition to the stronger border pulse near the edges).
-// 0 = no region shading; 1 = full soft-light tint. Tune for taste.
+// Strength of the soft-light tint applied across the *entire* realm
+// interior. 0 = no region shading; 1 = full soft-light tint. Tune for taste.
 const REALM_SHADE_STRENGTH: f32 = 0.55;
 
-// Sample the border SDF and return the inward-fade pulse strength at a
-// world position: 0 right on the border, peaks at BORDER_PEAK_PX inside,
-// fades back to 0 at BORDER_FADE_END_PX. Tri-points stay sharp because
-// the underlying SDF kinks (is non-differentiable) where multiple borders
-// meet.
-fn sample_border_fade(world_xz: vec2<f32>) -> f32 {
-    let uv = world_to_world_uv(world_xz);
-    let d_norm = textureSampleLevel(border_sdf, samp, uv, 0.0).x;
-    let d_px = d_norm * BORDER_MAX_DIST_PX;
-    let rise = smoothstep(0.0, BORDER_PEAK_PX, d_px);
-    let fall = 1.0 - smoothstep(BORDER_PEAK_PX, BORDER_FADE_END_PX, d_px);
-    return rise * fall;
+// Realm-edge tint applied in screen space to the influence-field iso-line
+// (`field.contested` near 1.0). The band itself is sized by
+// `BORDER_CONTEST_BAND` inside `fs_main`; these two control the colour of
+// the pulse drawn within it.
+const BORDER_TINT_STRENGTH: f32 = 0.65;  // peak mix amount on the iso-line
+const BORDER_TINT_BRIGHTEN: f32 = 1.4;   // pre-mix brightness boost on the realm tint
+
+// ----------------------------------------------------------------------------
+// Settlement influence field.
+//
+// Each settlement projects a radial influence `strength * exp(-d/E_FOLD)`.
+// The shader walks the (small) settlement list per pixel, tracking the
+// strongest realm and the strongest *competing*-realm strength as a
+// running second place. Output:
+//   * `realm_id`  — the realm with the largest field at this pixel.
+//   * `alpha`     — [0,1], saturates as `best_strength` grows; near 0 in
+//                   wilderness (no settlement reaches here), 1 well inside
+//                   any realm. Used to fade realm colouring out at the
+//                   edge of civilisation.
+//   * `contested` — best/second ratio. 1.0 right at the iso-line where two
+//                   realms tie; >1 inside a realm. Drives the live border
+//                   pulse via screen-space derivatives.
+//
+// Tracking second-place across realms (rather than across all settlements)
+// preserves correct ratios when a realm has multiple cities: a sibling
+// city's contribution is *not* a competitor, so the border between two
+// realms still falls at the equal-strength iso-line of the *strongest*
+// city in each.
+// ----------------------------------------------------------------------------
+// E-folding distance in km. Must match `E_FOLD_KM` in `settlements.rs`.
+const SETTLEMENT_E_FOLD_KM: f32 = 30.0;
+
+// Terrain-cost coefficients for the influence field. Each coefficient
+// scales the multiplier on "effective km per real km" along the path:
+//   * MOUNTAIN_COST: at the highest peak (h = 1.0 → 5000 m) the path
+//     costs `1 + MOUNTAIN_COST` units per real km, so a city's reach
+//     across a 5000 m peak is 1/(1 + MOUNTAIN_COST) of its plain reach.
+//   * WATER_COST: similarly for water bodies (lakes / sea).
+// Plains (low h, no water) stay at cost 1.0, the original euclidean
+// behaviour.
+const FIELD_MOUNTAIN_COST: f32 = 4.0;
+const FIELD_WATER_COST:    f32 = 3.0;
+
+// Number of midpoint samples along each settlement→fragment line. More
+// samples = more accurate path integral but more texture fetches per
+// pixel per settlement. 3 catches a single mountain ridge between two
+// valleys; bump to 5 if you want finer resolution at the cost of ~2/3
+// more samples in this hot loop.
+const FIELD_PATH_SAMPLES: u32 = 3u;
+
+// Per-point travel cost: how many "effective km" one real km of path
+// traversal costs at this world XZ. Samples the *base* heightmap (so
+// erosion bumps don't randomly spike the cost) and the world-anchored
+// water mask. Returns >= 1.0 always; 1.0 = plains.
+fn travel_cost(world_xz: vec2<f32>) -> f32 {
+    let layer_uv = clamp(
+        world_to_layer_uv(world_xz, layer),
+        vec2<f32>(0.0), vec2<f32>(1.0),
+    );
+    let h = textureSampleLevel(base_heightmap, samp, layer_uv, 0.0).x;
+    let w = textureSampleLevel(
+        water_mask, samp, world_to_world_uv(world_xz), 0.0,
+    ).x;
+    let h_n = clamp(h, 0.0, 1.0);
+    let w_n = clamp(w, 0.0, 1.0);
+    return 1.0 + h_n * FIELD_MOUNTAIN_COST + w_n * FIELD_WATER_COST;
+}
+
+// Effective km between two world points, integrating travel_cost across
+// the path with a fixed number of midpoint samples (Simpson-ish, but
+// for our purposes a plain mean is fine). Reduces to euclidean distance
+// in flat / dry terrain (cost ≡ 1.0).
+fn effective_distance(a: vec2<f32>, b: vec2<f32>) -> f32 {
+    let d_km = distance(a, b);
+    if (d_km < 1e-3) {
+        return d_km;
+    }
+    var cost_sum: f32 = 0.0;
+    let n = FIELD_PATH_SAMPLES;
+    for (var i: u32 = 0u; i < n; i = i + 1u) {
+        // Centred sample positions: t ∈ {1/2N, 3/2N, …, (2N-1)/2N}
+        let t = (f32(i) + 0.5) / f32(n);
+        cost_sum += travel_cost(mix(a, b, t));
+    }
+    let avg_cost = cost_sum / f32(n);
+    return d_km * avg_cost;
+}
+
+struct RealmField {
+    realm_id: u32,
+    // Index of the *specific* settlement whose contribution dominates at
+    // this pixel. Used by the hover path to highlight only the dominant
+    // city's hinterland (the cells where this city is the strongest), in
+    // contrast to `realm_id` which covers every same-realm city's cells.
+    city_idx: u32,
+    alpha: f32,
+    contested: f32,
+}
+
+// Jitter scales for the cultural-noise perturbation (see
+// `sample_realm_field`). Cycles-per-km on input × amplitude in km.
+//   * Big scale: ~17 km wavelength, up to ±8 km of jitter — country-scale
+//     meander where one realm wiggles a long arc into another.
+//   * Fine scale: ~2 km wavelength, up to ±1.5 km — ragged village-scale
+//     edges so the line never reads as perfectly smooth.
+// Tune `REALM_PERTURB_BIG_AMP` for taste: larger = more dramatic curves,
+// smaller = closer to the bake's clean iso-line.
+const REALM_PERTURB_BIG_FREQ:  f32 = 0.06;
+const REALM_PERTURB_BIG_AMP:   f32 = 8.0;
+const REALM_PERTURB_FINE_FREQ: f32 = 0.5;
+const REALM_PERTURB_FINE_AMP:  f32 = 1.5;
+
+fn sample_realm_field(world_xz: vec2<f32>) -> RealmField {
+    // Cultural-noise perturbation. The bake's argmax is sharp and the
+    // resulting iso-line traces straight-ish equidistance arcs between
+    // neighbouring realms; that reads as "painted on" once the eye gets
+    // used to it. We jitter the *lookup point* by multi-scale gradient
+    // noise so the boundary wiggles organically along this perturbation
+    // field instead of along the rigid argmax line. Two independent
+    // noise samples per scale (input shifted by an arbitrary constant)
+    // give independent X / Y jitter components.
+    let off = vec2<f32>(73.1, 41.9);
+    let big  = vec2<f32>(
+        noised(world_xz * REALM_PERTURB_BIG_FREQ).x,
+        noised(world_xz * REALM_PERTURB_BIG_FREQ + off).x,
+    );
+    let fine = vec2<f32>(
+        noised(world_xz * REALM_PERTURB_FINE_FREQ).x,
+        noised(world_xz * REALM_PERTURB_FINE_FREQ + off).x,
+    );
+    let perturb = big * REALM_PERTURB_BIG_AMP + fine * REALM_PERTURB_FINE_AMP;
+    let perturbed = world_xz + perturb;
+
+    // The bake pass already evaluated the per-pixel argmax-realm at every
+    // cell of `realm_field_tex`. Just look up the (perturbed) texel and
+    // unpack it. NEAREST is fine: realm_id and city_idx are categorical
+    // (we'd get fictional intermediate IDs from filtering), and the smooth
+    // GB channels are over a 2048² grid — plenty of resolution at this
+    // 5500 km world bbox.
+    let dim = vec2<f32>(textureDimensions(realm_field_tex));
+    let uv = world_to_world_uv(perturbed);
+    let coord_f = clamp(uv * dim, vec2<f32>(0.0), dim - vec2<f32>(1.0));
+    let coord = vec2<i32>(coord_f);
+    let s = textureLoad(realm_field_tex, coord, 0);
+    // R / A are stored as raw f32 ids (Rgba16Float, exact through 2048).
+    let realm_id = u32(round(s.x));
+    let city_idx = u32(round(s.w));
+    let alpha = s.y;
+    // The bake stored `clamp(contested - 1, 0, 1)`; recover by adding 1.
+    // Deep interiors saturate at contested = 2 (was unbounded), but
+    // that's only used near the iso-line where contested is near 1
+    // anyway and the gradient is preserved.
+    let contested = 1.0 + s.z;
+    return RealmField(realm_id, city_idx, alpha, contested);
 }
 
 // ----------------------------------------------------------------------------
@@ -626,22 +753,40 @@ fn map_height(uv: vec2<f32>) -> f32 {
     return h * VERTICAL_EXAGGERATION;
 }
 
+// Pre-erosion heightmap sample. Used for computing *smooth* derivatives:
+// the eroded `terrain` layer carries ~50 m of vertical detail at ~70 m
+// horizontal scale, which (a) aliases hard into the layer's 600 m–ish
+// texels at wide zooms and (b) would otherwise feed noisy per-texel
+// gradients into the shadow march and `cliff_mask` slope test. So we keep
+// `map_height` (eroded) for the actual surface position the raymarch hits,
+// but route normal / shadow lookups through the macro-scale base heightmap.
+fn map_height_base(uv: vec2<f32>) -> f32 {
+    let h = textureSampleLevel(base_heightmap, samp, uv, 0.0).x;
+    return h * VERTICAL_EXAGGERATION;
+}
+
 // height in .x, normal in .yzw (Y-up world space).
 fn map_full(uv: vec2<f32>) -> vec4<f32> {
+    // Surface height (returned in .x) tracks the eroded terrain, so the
+    // visual surface still has erosion micro-detail.
     let height = map_height(uv);
+    // Normal (returned in .yzw) is computed from the *base* heightmap. This
+    // gives smooth macro-slopes for cliff/snow/lighting decisions — erosion
+    // bumps don't masquerade as cliffs and don't speckle the lighting with
+    // pixelated artifacts.
     let pixel = 1.0 / vec2<f32>(LAYER_SIZE);
     let uv1 = uv + vec2<f32>(pixel.x, 0.0);
     let uv2 = uv + vec2<f32>(0.0, pixel.y);
-    let h1 = map_height(uv1);
-    let h2 = map_height(uv2);
+    let h0 = map_height_base(uv);
+    let h1 = map_height_base(uv1);
+    let h2 = map_height_base(uv2);
     // Convert the uv steps into world XZ steps (km per layer texel) so the
     // gradient is dimensionally consistent with the (already-VE-scaled)
-    // height. Without this, v1 / v2 would mix tiny uv units (~1e-3) with
-    // height units that can be ≫ 1, and the resulting normal would be
-    // almost horizontal regardless of the actual slope.
+    // height. Without this, the dhdx / dhdz scale mismatch would yield a
+    // near-horizontal normal regardless of the actual slope.
     let world_step = (layer.covered_max - layer.covered_min) * pixel;
-    let dhdx = (h1 - height) / world_step.x;
-    let dhdz = (h2 - height) / world_step.y;
+    let dhdx = (h1 - h0) / world_step.x;
+    let dhdz = (h2 - h0) / world_step.y;
     let normal = normalize(vec3<f32>(-dhdx, 1.0, -dhdz));
     return vec4<f32>(height, normal);
 }
@@ -729,6 +874,83 @@ fn get_reflection(p: vec3<f32>, r: vec3<f32>, sun: vec3<f32>, smoothness: f32) -
     return refl * (1.0 - exp(-m.s_t * 10.0 * sq(smoothness)));
 }
 
+// Lightweight shadow march: same algorithm as `march`, but samples the
+// smooth `base_heightmap` (no erosion) and only returns the soft-shadow
+// factor we actually need at the call site. Keeps shadow casting tied to
+// macro mountain shape instead of per-texel erosion bumps, which produced
+// the blocky pixelated shadow grid we were seeing at default zoom.
+fn shadow_march(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
+    var s_t: f32 = 9999.0;
+    let bs = box_size();
+    let bc = box_center();
+    let local_ro = ro - bc;
+    let box = box_intersection(local_ro, rd, bs);
+
+    let t_start = max(0.0, box.t_near) + 1e-2;
+    var step_size:  f32 = 0.0;
+    var step_scale: f32 = 1.0 / RAYMARCH_QUALITY;
+    let samples: i32 = i32(48.0 * RAYMARCH_QUALITY);
+    var t: f32 = t_start;
+
+    for (var i: i32 = 0; i < samples; i = i + 1) {
+        let pos = ro + rd * t;
+        let h = map_height_base(world_xz_to_uv(pos));
+        let altitude = pos.y - h;
+        s_t = max(0.0, min(s_t, altitude / t));
+        if (altitude < 0.0) {
+            step_scale *= 0.5;
+            t -= step_size * step_scale;
+        } else {
+            step_size = abs(altitude) + min(1e-2, abs(altitude) * 0.01);
+            t += step_size * step_scale;
+        }
+    }
+    return s_t;
+}
+
+// ----------------------------------------------------------------------------
+// Settlement markers.
+//
+// Draw a small dot at every settlement so the influence-field plot is
+// legible — "OK Zürich is here, that's why this corner is crimson". Each
+// dot has:
+//   * an outer realm-coloured ring (so you can read the city's allegiance
+//     at a glance), and
+//   * a bright cream core (so the dot reads against any terrain colour).
+// Radius scales with strength so big cities are visibly bigger pinpricks.
+// World-unit sized: at default zoom the dots are ~2 km wide — visible but
+// not overwhelming. Out of `MAX_SETTLEMENTS` we only consider the *closest*
+// one (smallest `distance / radius`) per fragment, so overlapping dots
+// don't double-tint.
+fn settlement_marker(world_xz: vec2<f32>) -> vec4<f32> {
+    var best_d_norm: f32 = 1.0e9;
+    var best_realm: u32 = 0u;
+    let n = min(settlements.count, MAX_SETTLEMENTS);
+    for (var i: u32 = 0u; i < n; i = i + 1u) {
+        let s = settlements.items[i];
+        let d_km = distance(world_xz, s.world_xz);
+        // Marker radius in km: ~1.0 km baseline + scales with sqrt(strength)
+        // so doubling population only ~1.4×s the dot, not 2×. Keeps small
+        // towns from being invisible while big cities don't dominate.
+        let radius = 1.0 + sqrt(max(s.strength, 0.0)) * 0.10;
+        let d_norm = d_km / radius;
+        if (d_norm < best_d_norm) {
+            best_d_norm = d_norm;
+            best_realm = s.realm_id;
+        }
+    }
+    if (best_d_norm > 1.0) {
+        return vec4<f32>(0.0);
+    }
+    let realm_col = realm_palette(best_realm);
+    // Inside-out structure: bright cream core, realm-coloured ring, soft
+    // anti-aliased outer edge.
+    let core = 1.0 - smoothstep(0.45, 0.55, best_d_norm);
+    let ring_outer = 1.0 - smoothstep(0.92, 1.0, best_d_norm);
+    let marker_rgb = mix(realm_col * 0.85, vec3<f32>(0.98, 0.95, 0.86), core);
+    return vec4<f32>(marker_rgb, ring_outer);
+}
+
 // ----------------------------------------------------------------------------
 // Main fragment shader
 // ----------------------------------------------------------------------------
@@ -763,6 +985,12 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         if (material == M_GROUND) {
             normal = map_full(world_xz_to_uv(pos)).yzw;
         }
+
+        // Settlement influence field, evaluated once per fragment. Drives
+        // the M_GROUND realm tint *and* the post-lighting border pulse;
+        // both share this single eval to keep the per-fragment
+        // settlement-loop cost down to one pass.
+        let field = sample_realm_field(pos.xz);
 
         // Water classification. The water_mask is treated as a *first
         // guess* only — the actual decision uses the heightmap (lakes
@@ -892,31 +1120,37 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             );
             diffuse_color *= 1.0 + tex * tex_strength;
 
-            // 6. Realm shading. Two-stage tinting depending on map mode:
-            //    * Terrain mode: soft-light blend at the diffuse stage, so
-            //      the entire province interior gets a gentle realm-colour
-            //      wash that follows the lighting (dimmer in shadow,
-            //      brighter in sun) and preserves terrain tonal detail
-            //      (highlights stay light, shadows stay dark). The
-            //      stronger coloured border pulse is added later, post-
-            //      lighting.
-            //    * Political mode: full opaque overwrite — flat realm fill
-            //      with a crisp shape, snow/cliff/sand discarded.
-            let pid_for_shade = sample_province_id(pos.xz);
-            if (pid_for_shade != 0u) {
+            // 6. Realm shading driven by the settlement influence field.
+            //    `field.alpha` fades the realm tint to 0
+            //    in wilderness so unclaimed land keeps its honest biome /
+            //    cliff colour, and saturates near 1 well inside any
+            //    realm.
+            //    * Terrain mode: soft-light blend, scaled by alpha. Within
+            //      a realm core, full realm wash; at the field edge, the
+            //      tint smoothly disappears.
+            //    * Political mode: pale-grey wilderness fades to opaque
+            //      realm colour as alpha rises.
+            if (field.alpha > 0.0) {
+                let realm_col = realm_palette(field.realm_id);
                 if (u.map_mode == MAP_MODE_POLITICAL) {
-                    diffuse_color = realm_color(pid_for_shade);
+                    let wilderness = vec3<f32>(0.55, 0.55, 0.50);
+                    diffuse_color = mix(wilderness, realm_col, field.alpha);
                 } else {
                     let safe_diffuse = clamp(
                         diffuse_color, vec3<f32>(0.0), vec3<f32>(1.0),
                     );
                     diffuse_color = mix(
                         diffuse_color,
-                        soft_light(safe_diffuse, realm_color(pid_for_shade)),
-                        REALM_SHADE_STRENGTH,
+                        soft_light(safe_diffuse, realm_col),
+                        REALM_SHADE_STRENGTH * field.alpha,
                     );
                 }
             }
+
+            // 7. Country-name labels are now drawn by a separate SDF
+            //    glyph-atlas pass on top of the swapchain (see
+            //    `passes::realm_labels`); previously we composited a
+            //    Canvas2D-baked overlay here.
         } else if (material == M_STRATA) {
             let diff = pos.y - map_height(world_xz_to_uv(pos));
             let strata = smoothstep(
@@ -945,11 +1179,14 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             smoothness = 0.95;
         }
 
-        // Shadow ray (skip for the inside-of-strata case).
+        // Shadow ray (skip for the inside-of-strata case). Routed through
+        // `shadow_march`, which samples the smooth base heightmap so
+        // erosion's per-texel bumps don't paint a blocky shadow grid over
+        // the surface.
         var shadow: f32 = 1.0;
         if (material != M_STRATA) {
-            let sh = march(pos + vec3<f32>(0.0, 1.0, 0.0) * 1e-4, sun);
-            shadow = 1.0 - exp(-sh.s_t * 20.0);
+            let s_t = shadow_march(pos + vec3<f32>(0.0, 1.0, 0.0) * 1e-4, sun);
+            shadow = 1.0 - exp(-s_t * 20.0);
         }
 
         // Lighting decomposition.
@@ -964,37 +1201,55 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         color += get_reflection(pos, r_dir, sun, smoothness)
             * f_schlick(f0, dot(-rd, normal));
 
-        // Province borders — applied to the *fully lit* color so their
-        // strength is independent of local lighting / shadow. Soft colored
-        // pulse: the local province's realm colour peaks ~5 px inside the
-        // edge and fades smoothly to 0 deeper into the province. The pulse
-        // also goes to 0 right at the edge itself, so neighbouring
-        // provinces from different realms show as *two* parallel coloured
-        // bands separated by a thin uncoloured line. Within-realm
-        // boundaries vanish (both sides tint with the same realm colour
-        // and there's no contrast).
+        // Live influence-field borders — the iso-line where two realms'
+        // fields tie. `field.contested = best/second_best` equals 1.0
+        // right on that line and grows inside a realm; we draw a band
+        // covering `contested ∈ [1.0, 1.0 + BORDER_CONTEST_BAND]`.
         //
-        // Mouse-hover highlight is also stitched in here so we only sample
-        // the province ID once per fragment.
-        if (material == M_GROUND) {
-            let pid = sample_province_id(pos.xz);
-            if (pid != 0u) {
-                let fade = sample_border_fade(pos.xz);
-                let tint = clamp(
-                    realm_color(pid) * BORDER_TINT_BRIGHTEN,
-                    vec3<f32>(0.0),
-                    vec3<f32>(1.0),
-                );
-                color = mix(color, tint, fade * BORDER_TINT_STRENGTH);
+        // We deliberately *don't* use `fwidth` here: WGSL strict mode
+        // disallows derivative builtins under non-uniform control flow
+        // (the surrounding `if (m.t < 0)` branch is non-uniform), and
+        // hoisting the derivative out of that branch requires evaluating
+        // the field at a screen-anchored pseudo-position. Constant-band
+        // is simpler and predictable; the trade-off is the on-screen
+        // border width changes with zoom (thicker at deep zoom, thinner
+        // when zoomed out). Tune `BORDER_CONTEST_BAND` for taste — with
+        // 30 km e-fold and ~equal-strength cities, 0.15 gives roughly a
+        // 2 km wide ground band.
+        const BORDER_CONTEST_BAND: f32 = 0.15;
+        let edge = 1.0 - smoothstep(
+            0.0, BORDER_CONTEST_BAND, field.contested - 1.0,
+        );
+        if (material == M_GROUND && field.alpha > 0.05) {
+            let realm_col = realm_palette(field.realm_id);
+            let tint = clamp(
+                realm_col * BORDER_TINT_BRIGHTEN,
+                vec3<f32>(0.0), vec3<f32>(1.0),
+            );
+            color = mix(color, tint, edge * BORDER_TINT_STRENGTH * field.alpha);
 
-                // Hover highlight: noticeable brightening + slight white
-                // wash on the entire hovered province. Only when something
-                // is actually being hovered (pid 0 is reserved for "no
-                // province" — sea, oob, etc.).
-                if (u.hovered_pid != 0u && pid == u.hovered_pid) {
-                    color = mix(color, vec3<f32>(1.0), 0.30);
-                }
+            // Hover highlights, layered:
+            //   * Realm wash: gentle white tint on every cell of the
+            //     hovered realm — shows the realm's overall extent.
+            //   * Hinterland wash: stronger tint on top, restricted to
+            //     cells whose dominant city matches the hovered city.
+            //     Both indices are `value + 1` on the CPU side so 0 is a
+            //     reserved "nothing hovered" sentinel.
+            if (u.hovered_pid != 0u && (field.realm_id + 1u) == u.hovered_pid) {
+                color = mix(color, vec3<f32>(1.0), 0.10);
             }
+            if (u.hovered_city != 0u && (field.city_idx + 1u) == u.hovered_city) {
+                color = mix(color, vec3<f32>(1.0), 0.18);
+            }
+        }
+
+        // Settlement markers. Dots that show *where the cities are*; the
+        // influence field is otherwise an invisible math object you have
+        // to infer from the colours. Drawn last so they sit on top of
+        // everything else (border tint, realm wash, hover, terrain).
+        if (material == M_GROUND) {
+            let marker = settlement_marker(pos.xz);
+            color = mix(color, marker.rgb, marker.a);
         }
     }
 
@@ -1036,5 +1291,279 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     color = tonemap_aces(color);
     color = pow(color, vec3<f32>(1.0 / 2.2));
 
+    return vec4<f32>(color, 1.0);
+}
+
+// ============================================================================
+// Mesh path (Option 3 from the perf investigation).
+//
+// `vs_mesh` rasterizes a tessellated grid over the cached layer AABB,
+// displacing each vertex by sampling the terrain heightmap. `fs_mesh` then
+// runs the same biome/water/realm/lighting code as `fs_main` but skips
+// everything that depends on the per-fragment ray:
+//   * No `march` / `box_intersection` — the rasterizer + depth buffer
+//     handle surface visibility.
+//   * No `shadow_march` — fixed `shadow = 1.0` (precompute later via a
+//     world-space sun-visibility bake).
+//   * No `get_reflection` — sky-only stand-in (it would call `march`).
+//   * No atmospheric scattering integral — replaced with a cheap
+//     exponential distance fog.
+//
+// Toggle from the `T` key in `lib.rs` to A/B against `fs_main`.
+// ============================================================================
+
+// Cells per side; vertex count = 6 * (MESH_GRID - 1)^2. Must match
+// `MESH_GRID` in `passes/image.rs` (used for the `draw(0..N, 0..1)`
+// count there).
+const MESH_GRID: u32 = 1024u;
+const MESH_NEAR: f32 = 0.1;
+const MESH_FAR: f32 = 12000.0;
+
+struct VsMeshOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) world_pos: vec3<f32>,
+}
+
+// Build (proj * view) from the existing camera uniforms. Same eye / look_at
+// / basis math as `get_ray()` in `fs_main` so the two paths align pixel-for-
+// pixel under matching cameras.
+fn make_view_proj() -> mat4x4<f32> {
+    let look_at = vec3<f32>(u.world_center.x, CAMERA_TARGET_Y, u.world_center.y);
+    let eye = look_at + u.eye_offset;
+    let forward = normalize(look_at - eye);
+    let world_up = vec3<f32>(0.0, 1.0, 0.0);
+    let right = normalize(cross(world_up, forward));
+    let up = cross(forward, right);
+
+    // View matrix: camera looks down -Z in view space. WGSL mat4x4 is
+    // column-major, so each `vec4` here is a column.
+    let view = mat4x4<f32>(
+        vec4<f32>(right.x, up.x, -forward.x, 0.0),
+        vec4<f32>(right.y, up.y, -forward.y, 0.0),
+        vec4<f32>(right.z, up.z, -forward.z, 0.0),
+        vec4<f32>(-dot(right, eye), -dot(up, eye), dot(forward, eye), 1.0),
+    );
+
+    // Reverse-Z would be more depth-precise, but [0,1] perspective is
+    // standard and matches WebGPU's default depth range. Right-handed,
+    // looking down -Z; near maps to 0, far maps to 1 after w-divide.
+    let aspect = u.i_resolution.x / u.i_resolution.y;
+    let f = 1.0 / tan(CAMERA_FOV_Y * 0.5 * DEG_TO_RAD);
+    let near = MESH_NEAR;
+    let far = MESH_FAR;
+    let proj = mat4x4<f32>(
+        vec4<f32>(f / aspect, 0.0, 0.0, 0.0),
+        vec4<f32>(0.0, f, 0.0, 0.0),
+        vec4<f32>(0.0, 0.0, far / (near - far), -1.0),
+        vec4<f32>(0.0, 0.0, near * far / (near - far), 0.0),
+    );
+    return proj * view;
+}
+
+// Decode a linear vertex index into a (u, v) ∈ [0, 1]^2 grid coordinate.
+// Six verts per cell encode two triangles in CCW order from above:
+//   tri A: BL  BR  TL
+//   tri B: BR  TR  TL
+// We use `cull_mode: None` on the pipeline so winding direction is
+// irrelevant; this layout is just convention.
+fn grid_uv(vi: u32) -> vec2<f32> {
+    let cells = MESH_GRID - 1u;
+    let cell = vi / 6u;
+    let corner = vi % 6u;
+    let cx = cell % cells;
+    let cy = cell / cells;
+    var ox: u32 = 0u;
+    var oy: u32 = 0u;
+    switch (corner) {
+        case 0u: { ox = 0u; oy = 0u; }
+        case 1u: { ox = 1u; oy = 0u; }
+        case 2u: { ox = 0u; oy = 1u; }
+        case 3u: { ox = 1u; oy = 0u; }
+        case 4u: { ox = 1u; oy = 1u; }
+        case 5u: { ox = 0u; oy = 1u; }
+        default: {}
+    }
+    return vec2<f32>(f32(cx + ox), f32(cy + oy)) / f32(cells);
+}
+
+@vertex
+fn vs_mesh(@builtin(vertex_index) vi: u32) -> VsMeshOut {
+    let uv = grid_uv(vi);
+    // Map uv ∈ [0,1] to the cached layer's world AABB. The mesh covers
+    // the camera-anchored layer rectangle, but its *displacement* comes
+    // from the world-anchored heightmap (4096², ~1.34 km/px) instead of
+    // the layer cache (1024², ~3 km/px at default zoom). That's the
+    // difference between visibly-faceted ridges and smooth ones.
+    let world_xz = mix(layer.covered_min, layer.covered_max, uv);
+    let world_uv = world_to_world_uv(world_xz);
+    let h_norm = sample_world_height(world_uv);
+    let h_terrain = h_norm * VERTICAL_EXAGGERATION;
+
+    // Water flattening. The heightmap stores bathymetry (below-sea-level
+    // seabed elevation), so leaving the mesh at h_terrain would draw
+    // seabed contours through the water shading. Snap submarine
+    // vertices to a flat sea level (WATER_HEIGHT, post-VE) so the ocean
+    // reads as a flat plane.
+    let w = textureSampleLevel(water_mask, samp, world_uv, 0.0).x;
+    let world_y = select(h_terrain, WATER_HEIGHT, w > 0.5);
+
+    let world_pos = vec3<f32>(world_xz.x, world_y, world_xz.y);
+    let vp = make_view_proj();
+    let clip_pos = vp * vec4<f32>(world_pos, 1.0);
+    return VsMeshOut(clip_pos, world_pos);
+}
+
+@fragment
+fn fs_mesh(in: VsMeshOut) -> @location(0) vec4<f32> {
+    let pos = in.world_pos;
+    let layer_uv = clamp(
+        world_to_layer_uv(pos.xz, layer),
+        vec2<f32>(0.0), vec2<f32>(1.0),
+    );
+    var normal = map_full(layer_uv).yzw;
+
+    let field = sample_realm_field(pos.xz);
+
+    // Water classification — same as fs_main but on a fixed surface.
+    var water_blend: f32 = sample_water_blend(pos.xz);
+    var material: i32 = M_GROUND;
+    if (water_blend > 0.5) {
+        material = M_WATER;
+        normal = vec3<f32>(0.0, 1.0, 0.0);
+    }
+
+    let breakup_tex = textureSampleLevel(detail_noise, samp, layer_uv, 0.0);
+    let breakup = breakup_tex.x / 3.4;
+    if (material == M_WATER) {
+        normal = normalize(
+            normal + vec3<f32>(breakup_tex.z, 0.0, breakup_tex.y) * 0.1,
+        );
+    }
+
+    // Eye-to-fragment direction for view-dependent shading. Mirrors
+    // `rd` in fs_main.
+    let look_at = vec3<f32>(u.world_center.x, CAMERA_TARGET_Y, u.world_center.y);
+    let eye = look_at + u.eye_offset;
+    let rd = normalize(pos - eye);
+
+    var diffuse_color = vec3<f32>(0.5);
+    var f0 = vec3<f32>(0.04);
+    var smoothness: f32 = 0.0;
+    let occlusion: f32 = 1.0;
+
+    if (material == M_GROUND) {
+        let h = pos.y;
+        let biome_id = sample_biome_id(pos.xz);
+        let default_grass = mix(
+            GRASS_COLOR1,
+            GRASS_COLOR2,
+            smoothstep(WATER_HEIGHT, TREE_LINE, h),
+        );
+        diffuse_color = select(
+            default_grass,
+            biome_grass_color(biome_id),
+            biome_known(biome_id),
+        );
+        let rock_alt_mask = smoothstep(TREE_LINE, SNOW_LINE, h);
+        diffuse_color = mix(diffuse_color, CLIFF_COLOR, rock_alt_mask);
+        let cliff_mask = 1.0 - smoothstep(0.4, 0.7, normal.y);
+        diffuse_color = mix(diffuse_color, CLIFF_COLOR, cliff_mask);
+        let snow_alt_mask = smoothstep(SNOW_LINE, PEAK_SNOW, h);
+        let snow_slope_mask = smoothstep(0.55, 0.85, normal.y);
+        diffuse_color = mix(
+            diffuse_color,
+            vec3<f32>(0.95, 0.97, 1.0),
+            snow_alt_mask * snow_slope_mask,
+        );
+        let sand_mask = 1.0 - smoothstep(
+            WATER_HEIGHT,
+            WATER_HEIGHT + 0.005 * VERTICAL_EXAGGERATION,
+            h,
+        );
+        diffuse_color = mix(diffuse_color, SAND_COLOR, sand_mask);
+        let wet_shore = smoothstep(0.05, 0.5, water_blend);
+        diffuse_color = mix(diffuse_color, WATER_SHORE_COLOR, wet_shore * 0.45);
+        diffuse_color *= 1.0 + breakup * 0.3;
+        let tex = texture_noise(pos.xz);
+        let tex_strength = mix(
+            mix(0.10, 0.20, cliff_mask),
+            0.05,
+            snow_alt_mask * snow_slope_mask,
+        );
+        diffuse_color *= 1.0 + tex * tex_strength;
+
+        if (field.alpha > 0.0) {
+            let realm_col = realm_palette(field.realm_id);
+            if (u.map_mode == MAP_MODE_POLITICAL) {
+                let wilderness = vec3<f32>(0.55, 0.55, 0.50);
+                diffuse_color = mix(wilderness, realm_col, field.alpha);
+            } else {
+                let safe_diffuse = clamp(
+                    diffuse_color, vec3<f32>(0.0), vec3<f32>(1.0),
+                );
+                diffuse_color = mix(
+                    diffuse_color,
+                    soft_light(safe_diffuse, realm_col),
+                    REALM_SHADE_STRENGTH * field.alpha,
+                );
+            }
+        }
+    } else { // M_WATER
+        let shore_strength = clamp(1.0 - (water_blend - 0.5) * 2.0, 0.0, 1.0);
+        diffuse_color = mix(WATER_COLOR, WATER_SHORE_COLOR, shore_strength);
+        diffuse_color *= 1.0 + breakup * 0.15;
+        smoothness = 0.95;
+    }
+
+    // Lighting. No shadow march in this path (precompute via a sun-
+    // visibility bake later) and no recursive `get_reflection`. The
+    // sky-color stand-in keeps water glints from going flat black.
+    let sun = normalize(vec3<f32>(-1.0, 0.4, 0.05));
+    let shadow: f32 = 1.0;
+    var color = diffuse_color * sky_color(normal, sun) * fd_lambert();
+    color *= occlusion;
+    color += shade(
+        diffuse_color, f0, smoothness, normal, -rd, sun, SUN_COLOR * shadow,
+    );
+    color += diffuse_color * SUN_COLOR
+        * (dot(normal, sun * vec3<f32>(1.0, -1.0, 1.0)) * 0.5 + 0.5)
+        * fd_lambert() / PI;
+    let r_dir = reflect(rd, normal);
+    color += sky_color(r_dir, sun) * 4.0
+        * f_schlick(f0, dot(-rd, normal)) * 0.3;
+
+    // Influence-field borders + hover wash (same as fs_main).
+    const BORDER_CONTEST_BAND: f32 = 0.15;
+    let edge = 1.0 - smoothstep(
+        0.0, BORDER_CONTEST_BAND, field.contested - 1.0,
+    );
+    if (material == M_GROUND && field.alpha > 0.05) {
+        let realm_col = realm_palette(field.realm_id);
+        let tint = clamp(
+            realm_col * BORDER_TINT_BRIGHTEN,
+            vec3<f32>(0.0), vec3<f32>(1.0),
+        );
+        color = mix(color, tint, edge * BORDER_TINT_STRENGTH * field.alpha);
+        if (u.hovered_pid != 0u && (field.realm_id + 1u) == u.hovered_pid) {
+            color = mix(color, vec3<f32>(1.0), 0.10);
+        }
+        if (u.hovered_city != 0u && (field.city_idx + 1u) == u.hovered_city) {
+            color = mix(color, vec3<f32>(1.0), 0.18);
+        }
+    }
+
+    if (material == M_GROUND) {
+        let marker = settlement_marker(pos.xz);
+        color = mix(color, marker.rgb, marker.a);
+    }
+
+    // (No atmospheric fog in this path. The previous distance-fog
+    // stand-in washed the entire map to white at EU4 camera scale
+    // — default eye is 3000 km out, so every fragment sat at the fog
+    // limit. A proper height-fog can be added later, but a missing fog
+    // is much closer to correct than an over-applied one.)
+
+    color = tonemap_aces(color);
+    color = pow(color, vec3<f32>(1.0 / 2.2));
     return vec4<f32>(color, 1.0);
 }

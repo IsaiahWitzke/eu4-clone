@@ -15,13 +15,18 @@ cd "$ROOT"
 # 1. Compile the binary crate to wasm.
 cargo build --target wasm32-unknown-unknown --profile "$PROFILE" -p eu4-app
 
-# 2. Run wasm-bindgen on the resulting .wasm file.
+# 2. Run wasm-bindgen on the resulting .wasm file. We pass `--keep-debug`
+#    unconditionally: when the cargo profile didn't emit DWARF (the
+#    default `release` case) it's a no-op, but with `PROFILE=profiling`
+#    the DWARF section survives into the final wasm so Chrome DevTools
+#    can symbolicate Rust frames in the Performance flame chart.
 WASM_INPUT="target/wasm32-unknown-unknown/${PROFILE}/eu4_app.wasm"
 wasm-bindgen \
   --target web \
   --out-dir dist \
   --out-name app \
   --no-typescript \
+  --keep-debug \
   "$WASM_INPUT"
 
 # 3. Copy the hand-written HTML into dist/.
@@ -31,7 +36,7 @@ cp web/index.html dist/index.html
 #    directly by the local server / GitHub Pages and fetched by the wasm at
 #    startup, so the wasm bundle itself stays small. Listed explicitly so that
 #    incidental files in assets/ (e.g. the local-only preview.png) don't ship.
-for asset in heightmap.png water_mask.png biome_mask.png province_mask.png border_sdf.png; do
+for asset in heightmap.png water_mask.png biome_mask.png cities.json glyph_atlas.png glyph_atlas.json; do
   src="$ROOT/crates/app/assets/$asset"
   if [ -f "$src" ]; then
     cp "$src" "$ROOT/dist/$asset"

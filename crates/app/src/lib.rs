@@ -6,8 +6,13 @@
 mod assets;
 mod camera;
 mod gpu;
+mod gpu_timing;
+mod labels;
 mod passes;
+mod perf;
 mod renderer;
+mod settlements;
+mod ui;
 mod world_layer;
 
 use std::cell::{Cell, RefCell};
@@ -21,6 +26,7 @@ use web_sys::console;
 use crate::camera::HOVER_PICK_Y;
 use crate::gpu::canvas_by_id;
 use crate::renderer::Renderer;
+use crate::ui::CityPanel;
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -51,6 +57,15 @@ struct FrameProfiler {
     cpu_samples: Vec<f64>,
     pacing_samples: Vec<f64>,
     last_size: (u32, u32),
+    /// Total `mousemove` events seen since the last flush. The mousemove
+    /// handler bumps this on every event; we report `events_per_sec`
+    /// alongside fps so it's obvious when input rate massively exceeds
+    /// paint rate (= each painted frame is doing N× the hover work it
+    /// needs to).
+    mousemove_count: u32,
+    /// Wallclock at which `mousemove_count` started accumulating. Used
+    /// to convert the count into events/sec.
+    mousemove_window_start: f64,
 }
 
 impl FrameProfiler {
@@ -59,7 +74,13 @@ impl FrameProfiler {
             cpu_samples: Vec::with_capacity(PROFILER_LOG_EVERY),
             pacing_samples: Vec::with_capacity(PROFILER_LOG_EVERY),
             last_size: (0, 0),
+            mousemove_count: 0,
+            mousemove_window_start: now_ms(),
         }
+    }
+
+    fn tick_mousemove(&mut self) {
+        self.mousemove_count += 1;
     }
 
     fn record(&mut self, cpu_ms: f64, pacing_ms: f64, size: (u32, u32)) {
@@ -98,10 +119,18 @@ impl FrameProfiler {
         let cn = self.cpu_samples.len();
         let pfps = if pmean > 0.0 { 1000.0 / pmean } else { 0.0 };
         let (w, h) = self.last_size;
+        // Convert mousemove count into events/sec over the elapsed
+        // window. Reset both for the next window.
+        let now = now_ms();
+        let mm_window_s = ((now - self.mousemove_window_start) / 1000.0).max(1e-3);
+        let mm_per_sec = self.mousemove_count as f64 / mm_window_s;
+        self.mousemove_count = 0;
+        self.mousemove_window_start = now;
         console::log_1(
             &format!(
                 "frame@{w}\u{00d7}{h} n={cn}: cpu avg={cmean:.2}ms ({cmin:.2}\u{2013}{cmax:.2}) | \
-                 paint avg={pmean:.2}ms ({pmin:.2}\u{2013}{pmax:.2}) (~{pfps:.0} FPS)"
+                 paint avg={pmean:.2}ms ({pmin:.2}\u{2013}{pmax:.2}) (~{pfps:.0} FPS) | \
+                 mousemove {mm_per_sec:.0}/s"
             )
             .into(),
         );
@@ -122,11 +151,20 @@ fn now_ms() -> f64 {
 /// pending for the next animation frame, this is a no-op — so a flood of
 /// `mousemove` events during a drag all coalesce into a single render at
 /// most once per display refresh.
+///
+/// The mousemove / wheel handlers stash the cursor position in
+/// `latest_mouse` without doing any work; we pull it (via `take`) once
+/// per painted frame and run the drag-pan + hover update here. This
+/// caps per-event cost to a single `Cell::set` regardless of how often
+/// mousemove fires (1000 Hz gaming mice, 120 Hz trackpads, etc.) — the
+/// real work runs at rAF cadence (≤ display refresh).
 fn schedule_frame(
     renderer: &Rc<RefCell<Renderer>>,
     pending: &Rc<Cell<bool>>,
     profiler: &Rc<RefCell<FrameProfiler>>,
     last_raf: &Rc<Cell<Option<f64>>>,
+    latest_mouse: &Rc<Cell<Option<(f32, f32)>>>,
+    dragging: &Rc<RefCell<Option<(f32, f32)>>>,
 ) {
     if pending.get() {
         return;
@@ -137,6 +175,8 @@ fn schedule_frame(
     let p = pending.clone();
     let prof = profiler.clone();
     let last = last_raf.clone();
+    let lm = latest_mouse.clone();
+    let dr = dragging.clone();
     // rAF callbacks receive a `DOMHighResTimeStamp` (ms since navigationStart);
     // the delta between consecutive timestamps is the real paint cadence.
     let cb = Closure::once_into_js(move |raf_t: f64| {
@@ -144,6 +184,26 @@ fn schedule_frame(
         let cpu_t0 = now_ms();
         let size = {
             let mut rb = r.borrow_mut();
+            // Consume the latest cursor position. `take` (vs `get`) means
+            // non-mouse schedule_frame paths (keydown, resize) don't
+            // re-run hover with stale coords — the scan only fires when
+            // a real mousemove has happened since the last paint.
+            if let Some((mx, my)) = lm.take() {
+                let css_w = rb.canvas().client_width().max(1) as f32;
+                let css_h = rb.canvas().client_height().max(1) as f32;
+                {
+                    // Drag-pan: only active while a button is held.
+                    // `dragging` stores the cursor position as-of the
+                    // *last consumed mousemove*, so the pan delta is
+                    // exactly (cursor_now - cursor_at_last_frame).
+                    let mut drag_ref = dr.borrow_mut();
+                    if let Some((lx, ly)) = *drag_ref {
+                        rb.camera_mut().pan_pixels(mx - lx, my - ly, css_w, css_h);
+                        *drag_ref = Some((mx, my));
+                    }
+                }
+                rb.update_hover(mx, my, css_w, css_h);
+            }
             rb.frame();
             (rb.gpu.width, rb.gpu.height)
         };
@@ -165,6 +225,29 @@ async fn run() {
     let renderer = Rc::new(RefCell::new(Renderer::new(canvas).await));
     renderer.borrow_mut().frame();
 
+    // ---- UI overlay -----------------------------------------------------
+    // The HTML-side markup lives in `web/index.html`; we just hold cached
+    // element handles in the Rust side. Wrap in `Rc<RefCell<...>>` so
+    // multiple event closures can share it.
+    let document = web_sys::window()
+        .expect("no window")
+        .document()
+        .expect("no document");
+    let city_panel = Rc::new(CityPanel::new(&document));
+
+    // Wire the panel's close button to hide the panel.
+    {
+        let panel = city_panel.clone();
+        if let Some(btn) = document.get_element_by_id("cp-close") {
+            let on_close = Closure::<dyn FnMut(_)>::new(move |_e: web_sys::MouseEvent| {
+                panel.hide();
+            });
+            btn.add_event_listener_with_callback("click", on_close.as_ref().unchecked_ref())
+                .expect("failed to attach close listener");
+            on_close.forget();
+        }
+    }
+
     // Shared frame-scheduling state. `pending` is set when a frame has been
     // requested for the next rAF tick; cleared inside the rAF callback. This
     // guarantees we render at most once per display refresh, regardless of
@@ -174,6 +257,19 @@ async fn run() {
     // Last rAF timestamp — used to compute paint cadence (the real frame
     // pacing the browser is achieving, possibly capped by GPU work).
     let last_raf: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
+    // Most recent cursor position (in CSS pixels) from a mousemove /
+    // wheel event. The handlers store into this Cell without doing any
+    // work; the rAF callback `take`s it and runs the drag-pan + hover
+    // update once per painted frame. Decouples per-event cost from
+    // per-frame cost — a 1000 Hz mouse stops translating into 1000
+    // hover scans per second.
+    let latest_mouse: Rc<Cell<Option<(f32, f32)>>> = Rc::new(Cell::new(None));
+    // `dragging` is Some(pos) iff a mouse button is held. The position
+    // is updated by the rAF callback to whichever cursor pos it just
+    // consumed, so the next frame's pan delta is `(cursor_now -
+    // cursor_at_last_paint)`. On mouseup, we compare the stored value
+    // against the mouseup position to tell a click from a drag.
+    let dragging: Rc<RefCell<Option<(f32, f32)>>> = Rc::new(RefCell::new(None));
 
     let window = web_sys::window().expect("no window");
 
@@ -183,9 +279,11 @@ async fn run() {
         let p = pending.clone();
         let prof = profiler.clone();
         let lr = last_raf.clone();
+        let lm = latest_mouse.clone();
+        let drag = dragging.clone();
         let on_resize = Closure::<dyn FnMut()>::new(move || {
             r.borrow_mut().handle_resize();
-            schedule_frame(&r, &p, &prof, &lr);
+            schedule_frame(&r, &p, &prof, &lr, &lm, &drag);
         });
         window.set_onresize(Some(on_resize.as_ref().unchecked_ref()));
         on_resize.forget();
@@ -197,6 +295,8 @@ async fn run() {
         let p = pending.clone();
         let prof = profiler.clone();
         let lr = last_raf.clone();
+        let lm = latest_mouse.clone();
+        let drag = dragging.clone();
         let on_keydown = Closure::<dyn FnMut(_)>::new(move |e: web_sys::KeyboardEvent| {
             let pan_step: f32 = 10.0;     // 10 km / press — sized for the Swiss bbox
             let tilt_step: f32 = 0.025;
@@ -215,6 +315,16 @@ async fn run() {
                     "=" | "+" => rb.camera_mut().zoom(1.0 / zoom_factor),
                     "-" | "_" => rb.camera_mut().zoom(zoom_factor),
                     "m" | "M" => rb.camera_mut().cycle_map_mode(),
+                    "t" | "T" => {
+                        // Toggle between the raymarched image pass and the
+                        // heightmap-mesh path. Lets us A/B the GPU cost
+                        // (read off the `gpu: image=...` log line) without
+                        // a rebuild.
+                        let next = rb.toggle_render_mode();
+                        console::log_1(
+                            &format!("render mode: {}", next.label()).into(),
+                        );
+                    }
                     _ => handled = false,
                 }
             }
@@ -222,7 +332,7 @@ async fn run() {
                 return;
             }
             e.prevent_default();
-            schedule_frame(&r, &p, &prof, &lr);
+            schedule_frame(&r, &p, &prof, &lr, &lm, &drag);
         });
         window
             .add_event_listener_with_callback("keydown", on_keydown.as_ref().unchecked_ref())
@@ -231,7 +341,11 @@ async fn run() {
     }
 
     // ---- Click-and-drag panning -----------------------------------------
-    let dragging: Rc<RefCell<Option<(f32, f32)>>> = Rc::new(RefCell::new(None));
+    /// Pixel slop within which a mousedown→mouseup pair counts as a
+    /// "click" instead of a "drag". 4 px feels right for desktop mice;
+    /// trackpads occasionally jiggle a couple of pixels even on a sharp
+    /// click, but more than that and the user clearly meant to pan.
+    const CLICK_SLOP_PX: f32 = 4.0;
 
     {
         let drag = dragging.clone();
@@ -250,36 +364,22 @@ async fn run() {
         let p = pending.clone();
         let prof = profiler.clone();
         let lr = last_raf.clone();
+        let lm = latest_mouse.clone();
         let drag = dragging.clone();
         let on_mousemove = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
+            // Count every mousemove (raw input rate) so the per-second
+            // log line can show input vs paint ratio.
+            prof.borrow_mut().tick_mousemove();
+
+            // Per-event work is now exactly this: stash the cursor
+            // position. The drag-pan + hover scan that used to run
+            // here have moved into the rAF callback (`schedule_frame`),
+            // so a 1000 Hz mouse no longer pays for 1000 hover scans
+            // per second — the work runs once per painted frame.
             let mx = e.client_x() as f32;
             let my = e.client_y() as f32;
-
-            let needs_redraw = {
-                let mut rb = r.borrow_mut();
-                let css_w = rb.canvas().client_width().max(1) as f32;
-                let css_h = rb.canvas().client_height().max(1) as f32;
-
-                // Drag pan (only active while a button is held).
-                let mut drag_ref = drag.borrow_mut();
-                let drag_pan = if let Some((lx, ly)) = *drag_ref {
-                    *drag_ref = Some((mx, my));
-                    rb.camera_mut().pan_pixels(mx - lx, my - ly, css_w, css_h);
-                    true
-                } else {
-                    false
-                };
-                drop(drag_ref);
-
-                // Always update hover so the highlight follows the cursor
-                // even when the user isn't dragging.
-                let hover_changed = rb.update_hover(mx, my, css_w, css_h);
-                drag_pan || hover_changed
-            };
-
-            if needs_redraw {
-                schedule_frame(&r, &p, &prof, &lr);
-            }
+            lm.set(Some((mx, my)));
+            schedule_frame(&r, &p, &prof, &lr, &lm, &drag);
         });
         window
             .add_event_listener_with_callback("mousemove", on_mousemove.as_ref().unchecked_ref())
@@ -289,8 +389,27 @@ async fn run() {
 
     {
         let drag = dragging.clone();
-        let on_mouseup = Closure::<dyn FnMut(_)>::new(move |_e: web_sys::MouseEvent| {
-            *drag.borrow_mut() = None;
+        let r = renderer.clone();
+        let panel = city_panel.clone();
+        let on_mouseup = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
+            // Convert mousedown→mouseup into a click iff the cursor
+            // didn't move far. Otherwise it was a drag-pan and we just
+            // clear the drag state.
+            let down = drag.borrow_mut().take();
+            if let Some((dx, dy)) = down {
+                let mx = e.client_x() as f32;
+                let my = e.client_y() as f32;
+                let moved = ((mx - dx).powi(2) + (my - dy).powi(2)).sqrt();
+                if moved <= CLICK_SLOP_PX {
+                    let rb = r.borrow();
+                    let css_w = rb.canvas().client_width().max(1) as f32;
+                    let css_h = rb.canvas().client_height().max(1) as f32;
+                    match rb.pick_settlement_at(mx, my, css_w, css_h) {
+                        Some(city) => panel.show(city),
+                        None => panel.hide(),
+                    }
+                }
+            }
         });
         window
             .add_event_listener_with_callback("mouseup", on_mouseup.as_ref().unchecked_ref())
@@ -304,6 +423,8 @@ async fn run() {
         let p = pending.clone();
         let prof = profiler.clone();
         let lr = last_raf.clone();
+        let lm = latest_mouse.clone();
+        let drag = dragging.clone();
         let on_wheel = Closure::<dyn FnMut(_)>::new(move |e: web_sys::WheelEvent| {
             // Suppress native page scrolling; we want every wheel tick to
             // zoom the map instead.
@@ -317,31 +438,35 @@ async fn run() {
             let mx = e.client_x() as f32;
             let my = e.client_y() as f32;
 
-            let mut rb = r.borrow_mut();
-            let css_w = rb.canvas().client_width().max(1) as f32;
-            let css_h = rb.canvas().client_height().max(1) as f32;
+            {
+                let mut rb = r.borrow_mut();
+                let css_w = rb.canvas().client_width().max(1) as f32;
+                let css_h = rb.canvas().client_height().max(1) as f32;
 
-            // Zoom toward the cursor: pick the world XZ under the cursor
-            // before and after the zoom, then shift world_center by their
-            // difference so the same world point stays under the cursor.
-            let before = rb
-                .camera_mut()
-                .pick_world_xz(mx, my, css_w, css_h, HOVER_PICK_Y);
-            rb.camera_mut().zoom(factor);
-            let after = rb
-                .camera_mut()
-                .pick_world_xz(mx, my, css_w, css_h, HOVER_PICK_Y);
-            if let (Some(b), Some(a)) = (before, after) {
-                let cam = rb.camera_mut();
-                cam.world_center[0] += b[0] - a[0];
-                cam.world_center[1] += b[1] - a[1];
+                // Zoom toward the cursor: pick the world XZ under the cursor
+                // before and after the zoom, then shift world_center by their
+                // difference so the same world point stays under the cursor.
+                // This has to run synchronously — the math depends on the
+                // *current* camera, not the post-rAF state.
+                let before = rb
+                    .camera_mut()
+                    .pick_world_xz(mx, my, css_w, css_h, HOVER_PICK_Y);
+                rb.camera_mut().zoom(factor);
+                let after = rb
+                    .camera_mut()
+                    .pick_world_xz(mx, my, css_w, css_h, HOVER_PICK_Y);
+                if let (Some(b), Some(a)) = (before, after) {
+                    let cam = rb.camera_mut();
+                    cam.world_center[0] += b[0] - a[0];
+                    cam.world_center[1] += b[1] - a[1];
+                }
             }
 
-            // Hover position changes (camera moved); refresh the highlight.
-            rb.update_hover(mx, my, css_w, css_h);
-            drop(rb);
-
-            schedule_frame(&r, &p, &prof, &lr);
+            // Camera moved; the cursor now picks a different world point,
+            // so leave hover-refresh to the rAF callback (it'll consume
+            // this cursor pos and re-run `update_hover`).
+            lm.set(Some((mx, my)));
+            schedule_frame(&r, &p, &prof, &lr, &lm, &drag);
         });
         // `passive: false` is required for prevent_default() to work on a
         // wheel listener — the browser default for wheel/touchmove on the
@@ -376,16 +501,83 @@ async fn run() {
         "./biome_mask.png",
         |r, decoded| r.set_biome_mask(decoded.width, decoded.height, &decoded.bytes),
     );
-    spawn_load(
-        renderer.clone(),
-        "./province_mask.png",
-        |r, decoded| r.set_province_mask(decoded.width, decoded.height, &decoded.bytes),
-    );
-    spawn_load(
-        renderer.clone(),
-        "./border_sdf.png",
-        |r, decoded| r.set_border_sdf(decoded.width, decoded.height, &decoded.bytes),
-    );
+
+    // cities.json — parsed into a LoadedSettlements (settlements +
+    // realm-name map) and pushed into the renderer once the bytes
+    // land. Until then the renderer keeps using its built-in Swiss
+    // defaults.
+    {
+        let r = renderer.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            match assets::fetch_text("./cities.json").await {
+                Ok(text) => match settlements::from_cities_json(&text) {
+                    Ok(loaded) => {
+                        console::log_1(
+                            &format!(
+                                "cities.json: loaded {} settlements ({} realms)",
+                                loaded.settlements.len(),
+                                loaded.realm_names.len(),
+                            )
+                            .into(),
+                        );
+                        let mut rb = r.borrow_mut();
+                        rb.set_settlements(loaded);
+                        rb.frame();
+                    }
+                    Err(e) => {
+                        console::error_1(&format!("cities.json parse failed: {e}").into());
+                    }
+                },
+                Err(err) => {
+                    console::error_1(
+                        &format!("failed to load cities.json: {err:?}").into(),
+                    );
+                }
+            }
+        });
+    }
+
+    // SDF glyph atlas — fetch the JSON metrics + the RGBA8 PNG
+    // (`script/gen-glyph-atlas` produced both), then install them on
+    // the renderer. The realm-labels render pass is a no-op until
+    // both arrive, so failures here just leave the map unlabelled.
+    {
+        let r = renderer.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let json = match assets::fetch_text("./glyph_atlas.json").await {
+                Ok(t) => t,
+                Err(err) => {
+                    console::error_1(
+                        &format!("failed to load glyph_atlas.json: {err:?}").into(),
+                    );
+                    return;
+                }
+            };
+            let png = match assets::fetch_rgba_png("./glyph_atlas.png").await {
+                Ok(p) => p,
+                Err(err) => {
+                    console::error_1(
+                        &format!("failed to load glyph_atlas.png: {err:?}").into(),
+                    );
+                    return;
+                }
+            };
+            console::log_1(
+                &format!(
+                    "loaded glyph_atlas.png: {}x{} ({} bytes)",
+                    png.width, png.height, png.bytes.len(),
+                )
+                .into(),
+            );
+            let mut rb = r.borrow_mut();
+            match rb.set_glyph_atlas(&json, png.width, png.height, &png.bytes) {
+                Ok(()) => rb.frame(),
+                Err(e) => {
+                    console::error_1(&format!("glyph_atlas: {e}").into());
+                }
+            }
+        });
+    }
 }
 
 /// Spawn a `fetch + decode + apply` task. `apply` mutates the renderer with

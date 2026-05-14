@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""
+Generate `crates/app/assets/biome_mask.png` \u2014 a categorical R8 mask
+where each pixel value is the WWF / RESOLVE Ecoregions 2017 `BIOME_NUM`
+(0..14 in their taxonomy; 0 = "no biome", e.g. ocean / outside).
+
+Biomes are categorical IDs and must NEVER be filtered \u2014 the shader
+samples this mask via `textureLoad` (NEAREST). Anywhere a pixel falls
+outside the source coverage (or on water) the value stays 0 and the
+shader falls back to the default green.
+
+Pipeline:
+  1. `gdal_rasterize -a BIOME_NUM` over the bbox into a UInt8 GeoTIFF
+     initialised to 0.
+  2. Convert to R8 PNG.
+"""
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _world import ASSETS_DIR, WORLD_BBOX, WORLD_TEX_SIZE  # noqa: E402
+
+WWF_DIR = ASSETS_DIR / "wwf"
+# `Ecoregions2017.shp` is the global RESOLVE Ecoregions 2017 in WGS 84 (lat/
+# lng, EPSG:4326). The repo also has an `Ecoregions2017_3857.shp` but it was
+# pre-clipped to a much smaller bbox during an earlier build, so we always
+# project + clip from the global source here.
+SRC_SHP = WWF_DIR / "Ecoregions2017.shp"
+LOCAL_SHP = WWF_DIR / "ecoregions_local.shp"
+BIOME_TIF = ASSETS_DIR / "biome_mask.tif"
+BIOME_PNG = ASSETS_DIR / "biome_mask.png"
+
+
+def clip_and_reproject():
+    """
+    Project the global Ecoregions shapefile to EPSG:3857 *and* clip to the
+    target bbox in one ogr2ogr call. Output is a tiny shapefile with only
+    the polygons we care about.
+    """
+    xmin, ymin, xmax, ymax = WORLD_BBOX
+    # Drop any prior local copy so ogr2ogr can recreate it.
+    for ext in ("shp", "shx", "dbf", "prj", "cpg"):
+        p = LOCAL_SHP.with_suffix(f".{ext}")
+        if p.exists():
+            p.unlink()
+    print(f"Projecting + clipping {SRC_SHP.name} → {LOCAL_SHP.name}")
+    subprocess.check_call([
+        "ogr2ogr",
+        "-f", "ESRI Shapefile",
+        "-t_srs", "EPSG:3857",
+        # `-clipdst` clips in the *output* (3857) CRS so the bbox numbers
+        # align with our WORLD_BBOX directly.
+        "-clipdst", str(xmin), str(ymin), str(xmax), str(ymax),
+        str(LOCAL_SHP),
+        str(SRC_SHP),
+    ])
+    info = subprocess.check_output([
+        "ogrinfo", "-so", str(LOCAL_SHP), LOCAL_SHP.stem,
+    ]).decode()
+    for line in info.splitlines():
+        if "Feature Count" in line:
+            print(f"  {line.strip()}")
+
+
+def main():
+    if not SRC_SHP.exists():
+        sys.exit(f"missing {SRC_SHP}")
+
+    t0 = time.time()
+    clip_and_reproject()
+
+    if BIOME_TIF.exists():
+        BIOME_TIF.unlink()
+
+    xmin, ymin, xmax, ymax = WORLD_BBOX
+    print(f"Rasterizing BIOME_NUM → {BIOME_TIF.name} ({WORLD_TEX_SIZE}² R8)")
+    subprocess.check_call([
+        "gdal_rasterize",
+        "-ot", "Byte",
+        "-a", "BIOME_NUM",
+        "-a_nodata", "0",
+        "-init", "0",
+        "-te", str(xmin), str(ymin), str(xmax), str(ymax),
+        "-ts", str(WORLD_TEX_SIZE), str(WORLD_TEX_SIZE),
+        "-of", "GTiff",
+        str(LOCAL_SHP),
+        str(BIOME_TIF),
+    ])
+
+    arr = np.asarray(Image.open(BIOME_TIF), dtype=np.uint8)
+    if arr.shape != (WORLD_TEX_SIZE, WORLD_TEX_SIZE):
+        sys.exit(f"unexpected raster shape {arr.shape}")
+    biomes_present = sorted(int(x) for x in np.unique(arr))
+    print(f"  biome IDs present: {biomes_present}")
+    print("  (0=ocean/none, 4=Temp Broadleaf, 5=Temp Conifer, 6=Boreal,")
+    print("   8=Temp Grassland, 11=Tundra, 12=Mediterranean, 13=Desert)")
+
+    Image.fromarray(arr, mode="L").save(BIOME_PNG, optimize=True)
+    print(f"  wrote {BIOME_PNG} ({BIOME_PNG.stat().st_size / 1024:.1f} KiB)")
+    print(f"done in {time.time() - t0:.1f}s")
+
+
+if __name__ == "__main__":
+    main()

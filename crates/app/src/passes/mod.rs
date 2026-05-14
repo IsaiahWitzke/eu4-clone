@@ -7,3 +7,5 @@ pub mod base_heightmap;
 pub mod detail_noise;
 pub mod erosion;
 pub mod image;
+pub mod realm_field;
+pub mod realm_labels;

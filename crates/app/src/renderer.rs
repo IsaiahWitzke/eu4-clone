@@ -11,24 +11,44 @@
 //! cache so the next frame regenerates from real data.
 
 use bytemuck;
-use web_sys::HtmlCanvasElement;
+use web_sys::{HtmlCanvasElement, Performance};
 
-use crate::camera::{Aabb2, Camera, CameraUniforms, HOVER_PICK_Y};
+use crate::camera::{Aabb2, CAMERA_FOV_Y_RAD, Camera, CameraUniforms, HOVER_PICK_Y};
 use crate::gpu::{GpuContext, compute_canvas_size};
-use crate::passes::{base_heightmap, detail_noise, erosion, image::ImagePass, image as image_pass};
+use crate::gpu_timing::{GpuTimer, Section};
+use crate::labels::{self, GlyphAtlas, LayoutSettings};
+use crate::passes::{
+    base_heightmap, detail_noise, erosion, image as image_pass,
+    image::{ImagePass, MESH_DEPTH_FORMAT, RenderMode},
+    realm_field as realm_field_pass, realm_field::RealmFieldPass,
+    realm_labels::{self as realm_labels_pass, RealmLabelsPass},
+};
+use crate::perf::{self, Span};
+use crate::settlements::{
+    LoadedSettlements, MAX_SETTLEMENTS, RealmInfo, Settlement, SettlementUniforms, WaterMask,
+    default_swiss_settlements, dominant_at_world_xz,
+    make_uniform_buf as make_settlement_uniform_buf, nearest_within_km, realm_infos,
+};
 use crate::world_layer::{LAYER_SIZE, LayerUniforms, WorldLayer, make_layer_uniform_buf};
 
 /// Padding factor for the world-layer cache: re-render only when the camera
-/// has moved past `view_aabb × PAD`.
-const PAD: f32 = 2.0;
+/// has moved past `view_aabb × PAD`. Bumped from 2.0 → 4.0 so the cached
+/// region covers 4× the visible AABB instead of 2×. You can pan ~1.5 view
+/// AABBs before triggering a regen (vs ~0.5 before), so per-frame layer
+/// regen cost — the dominant source of pan-stutter at certain zoom levels
+/// — fires ~4× less often. Cost per texel doubles (each 1024² layer now
+/// covers 4× more world), but `vs_mesh` samples `world_heightmap`
+/// directly so the mesh geometry isn't affected; only the layer-derived
+/// shading paths (normals, water blend, etc.) take the small fidelity
+/// hit. Worth it for the pan smoothness.
+const PAD: f32 = 4.0;
 
 /// Width/height of the asset textures (heightmap.png + water_mask.png).
-const WORLD_TEX_SIZE: u32 = 8192;
+/// Mirrors `WORLD_TEX_SIZE` in `script/_world.py`.
+const WORLD_TEX_SIZE: u32 = 4096;
 
-/// Half-extent of the world rectangle (km). Mirrors `WORLD_BOUNDS_HALF` in
-/// `shaders/world.wgsl`. Used by the CPU mouse-pick code to map world XZ
-/// back into province-mask UV coords.
-const WORLD_BOUNDS_HALF_KM: f32 = 313.037;
+// `WORLD_BOUNDS_HALF` lives in `shaders/world.wgsl`. CPU code no longer
+// needs it now that hover picks via the settlement field directly.
 
 pub struct Renderer {
     pub gpu: GpuContext,
@@ -52,30 +72,81 @@ pub struct Renderer {
     world_heightmap_view: wgpu::TextureView,
     water_mask_tex: wgpu::Texture,
     water_mask_view: wgpu::TextureView,
+    /// CPU copy of the water-mask bytes, kept around so the realm
+    /// rasteriser can filter out offshore cells (otherwise coastal
+    /// cities project their influence into the sea and the label
+    /// drifts off the map). `None` until `set_water_mask` runs;
+    /// `realm_infos` falls back to a land-everywhere assumption
+    /// while it's empty.
+    water_mask_cpu: Option<(Vec<u8>, u32, u32)>,
     /// Biome IDs (R8Unorm; pixel value = biome number 0..14, where 0 is
     /// "no biome / not classified"). Sampled with textureLoad in the shader.
     biome_mask_tex: wgpu::Texture,
     biome_mask_view: wgpu::TextureView,
-    /// Province IDs (Rg8Unorm carrying a 16-bit big-endian unsigned integer
-    /// per pixel; 0 = "no province"). Sampled with textureLoad in the shader
-    /// and reassembled to a `u32` ID for political coloring.
-    province_mask_tex: wgpu::Texture,
-    province_mask_view: wgpu::TextureView,
-    /// CPU-side copy of the province-mask bytes, kept around so we can
-    /// resolve a screen-space mouse position to a province ID without
-    /// round-tripping to the GPU. None until the PNG finishes loading.
-    province_mask_bytes: Option<Vec<u8>>,
-    /// Border signed-distance-field (R8Unorm; pixel value = clamped
-    /// distance-to-nearest-border encoded as 0..255). Pre-baked offline by
-    /// `script/gen-border-sdf` from the smoothed NUTS-3 boundaries.
-    /// **Filterable** — the shader bilinearly samples it and runs the result
-    /// through smoothstep for AA'd, thickness-controllable borders.
-    border_sdf_tex: wgpu::Texture,
-    border_sdf_view: wgpu::TextureView,
+
+    /// Settlement list — the influence-field point sources. The CPU keeps
+    /// the full struct (with names, etc.) for hover lookup + future editing;
+    /// `settlements_uniform_buf` mirrors a packed GPU view of it.
+    settlements: Vec<Settlement>,
+    settlements_uniform_buf: wgpu::Buffer,
+    /// realm_id → display name. Populated by the cities.json loader (or
+    /// the hardcoded Swiss seed) and consumed by [`RealmInfo`] for the
+    /// label UI. Sparse: missing entries fall back to `"Realm {id}"`.
+    realm_names: std::collections::HashMap<u32, String>,
+    /// Per-realm summary (centroid + name + total strength), recomputed
+    /// whenever `set_settlements` runs. The HTML overlay reads this each
+    /// frame to position country labels.
+    realm_infos: Vec<RealmInfo>,
+
+    /// Pre-baked realm-influence field. Re-baked whenever the settlement
+    /// list changes; the image pass reads it via `textureLoad` instead of
+    /// looping over settlements per fragment.
+    realm_field: RealmFieldPass,
+
+    /// True when the realm-field bake is dirty and needs a re-render at
+    /// the start of the next frame. Set by `set_settlements` /
+    /// `upload_settlements`; cleared after the bake runs.
+    realm_field_dirty: bool,
+
+    /// SDF glyph atlas. `None` until `glyph_atlas.png` + JSON have been
+    /// fetched; the realm-labels pass renders nothing while it's empty.
+    glyph_atlas: Option<GlyphAtlas>,
+    /// Placeholder glyph atlas resources kept alive while the
+    /// `glyph_atlas` field is `None` so the realm-labels pass's bind
+    /// group stays valid. Dropped once the real atlas lands.
+    _placeholder_atlas: Option<(wgpu::Texture, wgpu::TextureView, wgpu::Sampler)>,
+    /// Realm-name overlay pass. World-space SDF glyph quads, drawn
+    /// after the image pass with alpha blending. Vertex buffer is
+    /// rebuilt whenever `set_settlements` or `set_glyph_atlas` runs.
+    realm_labels: RealmLabelsPass,
 
     /// Bind-group layouts kept around for swap-in.
     base_heightmap_bgl: wgpu::BindGroupLayout,
     image_bgl: wgpu::BindGroupLayout,
+
+    /// Cached `window.performance` handle. Used by [`crate::perf::Span`]
+    /// to emit User Timing marks/measures around per-frame work; cached
+    /// because `window().performance()` traverses two `Option` layers
+    /// and JsValue casts on every call.
+    performance: Performance,
+
+    /// Per-pass GPU timer. `None` when the backend doesn't support
+    /// `TIMESTAMP_QUERY` (e.g. WebGL2 fallback).
+    gpu_timer: Option<GpuTimer>,
+
+    /// Which image-pass path to use this frame. Toggled at runtime with
+    /// the `T` key (see `lib.rs`). `RenderMode::Raymarch` matches the
+    /// historical behaviour; `RenderMode::Mesh` rasterizes a tessellated
+    /// heightmap-displaced grid for an A/B comparison.
+    render_mode: RenderMode,
+
+    /// Depth attachment for the mesh path. Recreated whenever the canvas
+    /// resizes; unused (but still bound) on the raymarch path.
+    depth_tex: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+    /// Canvas size the current `depth_tex` was built for; lets
+    /// `handle_resize` skip rebuilding on no-op resizes.
+    depth_size: (u32, u32),
 
     pub base_heightmap: WorldLayer,
     pub detail_noise: WorldLayer,
@@ -86,6 +157,11 @@ pub struct Renderer {
 impl Renderer {
     pub async fn new(canvas: HtmlCanvasElement) -> Self {
         let gpu = GpuContext::new(canvas).await;
+
+        let performance = web_sys::window()
+            .expect("no window")
+            .performance()
+            .expect("no performance");
 
         let camera = Camera::new();
         let camera_uniform_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -120,18 +196,28 @@ impl Renderer {
         // the safe behaviour while the real biome mask is in flight.
         let (biome_mask_tex, biome_mask_view) =
             placeholder_r8unorm(&gpu, "biome_mask (placeholder)");
-        // Province 0 → "no province". Same Rg8Unorm split-bytes encoding as
-        // the heightmap (the PNG is 16-bit grayscale, big-endian).
-        let (province_mask_tex, province_mask_view) =
-            placeholder_rg8unorm(&gpu, "province_mask (placeholder)");
-        // Border SDF: 1×1 R8Unorm value 255 → "infinite distance to any
-        // border", which makes the border smoothstep return 0 (no darkening)
-        // until the real PNG lands.
-        let (border_sdf_tex, border_sdf_view) =
-            placeholder_texture(&gpu, "border_sdf (placeholder)", wgpu::TextureFormat::R8Unorm, &[255u8]);
 
         let base_heightmap_bgl = base_heightmap::bgl(&gpu.device);
         let image_bgl = image_pass::bgl(&gpu.device);
+
+        // Build the settlement list + its uniform buffer up-front so the
+        // image pass's bind group has real data on the very first frame.
+        let LoadedSettlements {
+            settlements,
+            realm_names,
+        } = default_swiss_settlements();
+        // No water mask available yet (it's loaded async); rasterise
+        // the field with land-everywhere assumption. Will be rebuilt
+        // once the PNG lands.
+        let realm_infos_init = realm_infos(&settlements, &realm_names, None);
+        let settlements_uniform_buf =
+            make_settlement_uniform_buf(&gpu, "settlements ub");
+        let settlement_data = SettlementUniforms::from_slice(&settlements);
+        gpu.queue.write_buffer(
+            &settlements_uniform_buf,
+            0,
+            bytemuck::bytes_of(&settlement_data),
+        );
 
         let base_heightmap = base_heightmap::build(
             &gpu,
@@ -142,6 +228,24 @@ impl Renderer {
         );
         let detail_noise = detail_noise::build(&gpu, &layer_uniform_buf);
         let erosion = erosion::build(&gpu, &layer_uniform_buf, &base_heightmap.view);
+
+        // Optional per-pass GPU timer. Returns None on WebGL2 (and
+        // logs an explanatory line); otherwise we'll record begin/end
+        // timestamps around the world layers, the realm-field bake,
+        // and the image pass each frame.
+        let gpu_timer = GpuTimer::try_new(&gpu);
+
+        // Depth attachment for the mesh path. Sized to the current
+        // swapchain; we'll recreate in `handle_resize`.
+        let (depth_tex, depth_view) = make_depth(&gpu, gpu.width, gpu.height);
+        let depth_size = (gpu.width, gpu.height);
+
+        // Settlement-influence bake target. Built before the image pass so
+        // its texture view can feed the image pass's bind group. The
+        // initial bake happens on the first `frame()` call (we set
+        // `realm_field_dirty = true` below).
+        let realm_field = realm_field_pass::build(&gpu, &settlements_uniform_buf);
+
         let image = ImagePass::build(
             &gpu,
             &image_bgl,
@@ -153,8 +257,23 @@ impl Renderer {
             &water_mask_view,
             &sampler,
             &biome_mask_view,
-            &province_mask_view,
-            &border_sdf_view,
+            &settlements_uniform_buf,
+            &realm_field.view,
+            &world_heightmap_view,
+        );
+
+        // Realm-labels pass. Built with a 1×1 placeholder atlas so the
+        // bind group is valid before `glyph_atlas.png` lands. The pass
+        // is a no-op (`vertex_count == 0`) until both the atlas + the
+        // settlement layout are ready, so the placeholder content never
+        // gets sampled.
+        let placeholder_atlas = realm_labels_pass::placeholder_atlas(&gpu);
+        let realm_labels = RealmLabelsPass::build(
+            &gpu,
+            &camera_uniform_buf,
+            &placeholder_atlas.1,
+            &placeholder_atlas.2,
+            gpu.swapchain_format,
         );
 
         Self {
@@ -168,15 +287,28 @@ impl Renderer {
             world_heightmap_view,
             water_mask_tex,
             water_mask_view,
+            water_mask_cpu: None,
             biome_mask_tex,
             biome_mask_view,
-            province_mask_tex,
-            province_mask_view,
-            province_mask_bytes: None,
-            border_sdf_tex,
-            border_sdf_view,
+            settlements,
+            settlements_uniform_buf,
+            realm_names,
+            realm_infos: realm_infos_init,
+            realm_field,
+            // Initial settlements were just uploaded; bake before the
+            // first image pass so binding(11) has real data.
+            realm_field_dirty: true,
+            glyph_atlas: None,
+            _placeholder_atlas: Some(placeholder_atlas),
+            realm_labels,
             base_heightmap_bgl,
             image_bgl,
+            performance,
+            gpu_timer,
+            render_mode: RenderMode::default(),
+            depth_tex,
+            depth_view,
+            depth_size,
             base_heightmap,
             detail_noise,
             erosion,
@@ -192,24 +324,85 @@ impl Renderer {
         &mut self.camera
     }
 
+    /// Read-only access to the settlement list. The UI layer uses this to
+    /// look up the city the user just clicked on (name, realm, strength).
+    pub fn settlements(&self) -> &[Settlement] {
+        &self.settlements
+    }
+
+    /// Per-realm summaries (name + centroid + total strength). The HTML
+    /// overlay's `RealmLabels` reads this each frame to draw country
+    /// labels. Re-computed whenever `set_settlements` is called.
+    pub fn realm_infos(&self) -> &[RealmInfo] {
+        &self.realm_infos
+    }
+
+    /// Resolve a screen-space click (CSS pixels) to the nearest settlement.
+    /// The click radius scales with zoom so deeply zoomed-in views give a
+    /// tight 2 km radius and pulled-back views give a generous one.
+    /// Returns `None` if the click misses (no city within the radius, or
+    /// the click ray didn't intersect the ground plane at all).
+    pub fn pick_settlement_at(
+        &self,
+        mx: f32,
+        my: f32,
+        css_w: f32,
+        css_h: f32,
+    ) -> Option<&Settlement> {
+        let xz = self.camera.pick_world_xz(mx, my, css_w, css_h, HOVER_PICK_Y)?;
+        // Visible vertical extent in world km (one full screen height,
+        // matching `Camera::view_aabb`). Click radius is 1/25th of that
+        // with a 2 km floor so close zooms still let you click cities.
+        let view_h_km = 2.0 * self.camera.distance * (CAMERA_FOV_Y_RAD * 0.5).tan();
+        let radius_km = (view_h_km / 25.0).max(2.0);
+        nearest_within_km(&self.settlements, xz, radius_km).map(|i| &self.settlements[i])
+    }
+
     /// Reconfigure the swapchain to the canvas's current backing size.
+    /// Also recreates the depth texture used by the mesh path so it
+    /// matches the new dimensions.
     pub fn handle_resize(&mut self) {
         let (w, h) = compute_canvas_size(&self.gpu.canvas);
         if (w, h) == (self.gpu.width, self.gpu.height) {
             return;
         }
         self.gpu.resize(w, h);
+        if self.depth_size != (w, h) {
+            let (tex, view) = make_depth(&self.gpu, w, h);
+            self.depth_tex = tex;
+            self.depth_view = view;
+            self.depth_size = (w, h);
+        }
         // World layers are independent of swapchain size; nothing else to do.
+    }
+
+    /// Toggle between the raymarch and mesh image-pass paths. Returns
+    /// the new mode so callers can log it.
+    pub fn toggle_render_mode(&mut self) -> RenderMode {
+        self.render_mode = self.render_mode.toggled();
+        self.render_mode
     }
 
     /// Run one frame: push camera uniforms, regenerate world layers if the
     /// camera left the cached region, run the image pass to swapchain.
+    ///
+    /// Each phase is wrapped in a [`Span`] so the work shows up as
+    /// labelled bars in DevTools' Performance timeline. Spans nest:
+    /// `frame` is the outer bar, with `frame.world_layers`,
+    /// `frame.realm_field_bake`, `frame.image_encode`,
+    /// `frame.acquire`, `frame.submit`, `frame.present` as inner
+    /// children.
     pub fn frame(&mut self) {
+        let _frame_span = Span::new(&self.performance, "frame");
+
         // 1. Camera uniforms — cheap, always update.
-        let uniforms = self.camera.to_uniforms(self.gpu.width, self.gpu.height);
-        self.gpu
-            .queue
-            .write_buffer(&self.camera_uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        {
+            let _s = Span::new(&self.performance, "frame.camera_uniforms");
+            let uniforms = self.camera.to_uniforms(self.gpu.width, self.gpu.height);
+            self.gpu
+                .queue
+                .write_buffer(&self.camera_uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        }
 
         // 2. World-layer cache: re-render iff the camera's view AABB (×PAD)
         // is no longer contained in `layer_covered`.
@@ -220,7 +413,17 @@ impl Renderer {
 
         let mut encoder = self.gpu.encoder("frame");
 
+        // Decide whether to record GPU timestamps this frame. False if
+        // the timer doesn't exist (WebGL2) or the previous frame's
+        // readback hasn't completed yet.
+        let timing_active = self
+            .gpu_timer
+            .as_mut()
+            .map(|t| t.begin_frame())
+            .unwrap_or(false);
+
         if cache_stale {
+            let _s = Span::new(&self.performance, "frame.world_layers");
             self.layer_covered = Some(need);
             let layer_u = LayerUniforms::from_aabb(need);
             self.gpu.queue.write_buffer(
@@ -229,17 +432,100 @@ impl Renderer {
                 bytemuck::bytes_of(&layer_u),
             );
             // Order matters: erosion reads base_heightmap; both must use the
-            // same covered AABB this frame.
-            self.base_heightmap.render(&mut encoder);
-            self.detail_noise.render(&mut encoder);
-            self.erosion.render(&mut encoder);
+            // same covered AABB this frame. We bracket the *whole* layers
+            // span by writing only the begin timestamp on the first
+            // sub-pass and only the end timestamp on the last.
+            let begin = if timing_active {
+                self.gpu_timer.as_mut().map(|t| t.writes_begin(Section::Layers))
+            } else {
+                None
+            };
+            self.base_heightmap.render(&mut encoder, begin);
+            self.detail_noise.render(&mut encoder, None);
+            let end = if timing_active {
+                self.gpu_timer.as_mut().map(|t| t.writes_end(Section::Layers))
+            } else {
+                None
+            };
+            self.erosion.render(&mut encoder, end);
+        }
+
+        // 2b. Realm-field bake — only when the settlement list changed.
+        // The image pass reads from `realm_field.view` via textureLoad; the
+        // bake itself is a single fullscreen draw so it's cheap.
+        if self.realm_field_dirty {
+            let _s = Span::new(&self.performance, "frame.realm_field_bake");
+            let bake_writes = if timing_active {
+                self.gpu_timer.as_mut().map(|t| t.writes_full(Section::Bake))
+            } else {
+                None
+            };
+            self.realm_field.render(&mut encoder, bake_writes);
+            self.realm_field_dirty = false;
         }
 
         // 3. Image pass to swapchain.
-        let (frame, frame_view) = self.gpu.acquire_frame();
-        self.image.render(&mut encoder, &frame_view);
-        self.gpu.submit(encoder);
-        frame.present();
+        let (frame, frame_view) = {
+            let _s = Span::new(&self.performance, "frame.acquire");
+            self.gpu.acquire_frame()
+        };
+        {
+            let _s = Span::new(&self.performance, "frame.image_encode");
+            let image_writes = if timing_active {
+                self.gpu_timer.as_mut().map(|t| t.writes_full(Section::Image))
+            } else {
+                None
+            };
+            self.image.render(
+                &mut encoder,
+                &frame_view,
+                &self.depth_view,
+                self.render_mode,
+                image_writes,
+            );
+        }
+
+        // 3b. Realm-name overlay. Cheap (a few hundred glyph quads at
+        // most) and a no-op until the SDF atlas + a non-empty
+        // realm-info list have both landed.
+        {
+            let _s = Span::new(&self.performance, "frame.realm_labels");
+            self.realm_labels.render(&mut encoder, &frame_view);
+        }
+
+        // Resolve the timestamps + queue the readback copy *before*
+        // submission so they ride along in the same encoder.
+        if timing_active {
+            if let Some(t) = self.gpu_timer.as_ref() {
+                t.resolve(&mut encoder);
+            }
+        }
+
+        {
+            let _s = Span::new(&self.performance, "frame.submit");
+            self.gpu.submit(encoder);
+        }
+
+        // Schedule the async map_async *after* submit; the GPU has to
+        // chew through the resolve+copy before the map can complete.
+        if timing_active {
+            if let Some(t) = self.gpu_timer.as_mut() {
+                t.after_submit();
+            }
+        }
+
+        {
+            let _s = Span::new(&self.performance, "frame.present");
+            frame.present();
+        }
+
+        // Outer span finishes here (drop order = reverse of construction).
+        drop(_frame_span);
+        // Empty the User Timing buffer so a long session doesn't
+        // accumulate marks/measures forever. The DevTools recorder
+        // already snapshotted them via PerformanceObserver, so clearing
+        // here is safe even mid-recording.
+        perf::clear_buffer(&self.performance);
     }
 
     /// Upload a fresh 8192² R16Unorm world heightmap from the PNG bytes
@@ -284,7 +570,10 @@ impl Renderer {
     }
 
     /// Upload a fresh 8192² R8Unorm water mask. Symmetrical with
-    /// `set_world_heightmap`, but only the image pass references it.
+    /// `set_world_heightmap`, but also stores a CPU copy of the bytes
+    /// so `realm_infos` can drop offshore cells from the rasteriser,
+    /// and triggers a fresh realm-info + label rebuild so the labels
+    /// reposition onto land once water data lands.
     pub fn set_water_mask(&mut self, width: u32, height: u32, bytes: &[u8]) {
         if (width, height) != (WORLD_TEX_SIZE, WORLD_TEX_SIZE) {
             web_sys::console::warn_1(
@@ -308,108 +597,53 @@ impl Renderer {
         self.water_mask_tex = tex;
         self.water_mask_view = view;
         self.rebuild_image_bind_group();
+
+        // Stash the bytes CPU-side, then re-run the realm rasteriser
+        // now that we can filter out sea cells. Label vertices follow.
+        self.water_mask_cpu = Some((bytes.to_vec(), width, height));
+        self.recompute_realm_infos();
+        self.rebuild_realm_label_vertices();
     }
 
-    /// Upload a fresh 8192² Rg8Unorm province mask. The PNG is 16-bit
-    /// grayscale (big-endian); we upload the [hi, lo] bytes verbatim into
-    /// R + G channels and let the shader reassemble them. ID 0 = "no
-    /// province". Also keeps a CPU copy of the bytes for mouse-pick.
-    pub fn set_province_mask(&mut self, width: u32, height: u32, bytes: &[u8]) {
-        if (width, height) != (WORLD_TEX_SIZE, WORLD_TEX_SIZE) {
-            web_sys::console::warn_1(
-                &format!(
-                    "province mask size mismatch: got {width}x{height}, expected \
-                     {WORLD_TEX_SIZE}\u{00d7}{WORLD_TEX_SIZE}"
-                )
-                .into(),
-            );
-        }
-        let tex = upload_world_texture(
-            &self.gpu,
-            "province_mask",
-            wgpu::TextureFormat::Rg8Unorm,
-            width,
-            height,
-            bytes,
-            2, // bytes per pixel: 16-bit grayscale split across R + G
-        );
-        let view = tex.create_view(&Default::default());
-        self.province_mask_tex = tex;
-        self.province_mask_view = view;
-        // Clone for CPU-side hover picking. ~128 MB at full resolution but
-        // happens once per session.
-        self.province_mask_bytes = Some(bytes.to_vec());
-        self.rebuild_image_bind_group();
-    }
-
-    /// Update the hovered-province state from a screen-space mouse position
-    /// (CSS pixels). Returns `true` iff the hovered province changed (so the
-    /// caller can avoid redundant frames).
+    /// Update the hovered-realm + hovered-city state from a screen-space
+    /// mouse position (CSS pixels). Returns `true` iff *either* the realm
+    /// or the city under the cursor changed.
+    ///
+    /// Mirrors `sample_realm_field` on the CPU — picking the world XZ
+    /// under the cursor via the camera ray, then evaluating the
+    /// argmax-strength settlement at that point. Both indices are stored
+    /// as `value + 1` so 0 is the "nothing hovered" sentinel.
     pub fn update_hover(&mut self, mx: f32, my: f32, css_w: f32, css_h: f32) -> bool {
-        let prev = self.camera.hovered_pid;
-        let pid = self
+        // Wrap the whole pick + 683-settlement scan in a Span so its
+        // cumulative cost shows up in DevTools' Performance → Timings
+        // track. On a 1000 Hz trackpad this fires up to ~16× per
+        // painted frame, so it's worth seeing the total time per
+        // second — not just the per-call cost.
+        let _s = Span::new(&self.performance, "hover.update");
+        let (prev_realm, prev_city) = (self.camera.hovered_pid, self.camera.hovered_city);
+        let (realm_id, city_id) = self
             .camera
             .pick_world_xz(mx, my, css_w, css_h, HOVER_PICK_Y)
-            .map(|xz| self.province_at_world_xz(xz))
-            .unwrap_or(0);
-        if pid != prev {
-            self.camera.hovered_pid = pid;
-            true
-        } else {
-            false
+            .map(|xz| {
+                let hit = dominant_at_world_xz(&self.settlements, xz);
+                // Below this threshold the field is so weak no realm /
+                // city has any meaningful presence — treat as wilderness.
+                // Threshold mirrors the shader's `field.alpha > 0.05`
+                // gate (alpha = 1 - exp(-strength * 0.1) crosses 0.05 at
+                // strength ≈ 0.51).
+                if hit.strength < 0.5 {
+                    (0_u32, 0_u32)
+                } else {
+                    (hit.realm_id + 1, hit.city_idx + 1)
+                }
+            })
+            .unwrap_or((0, 0));
+        let changed = realm_id != prev_realm || city_id != prev_city;
+        if changed {
+            self.camera.hovered_pid = realm_id;
+            self.camera.hovered_city = city_id;
         }
-    }
-
-    /// Look up the province ID at a world XZ position, using the CPU copy
-    /// of the province mask. Returns 0 if the position is out of bounds or
-    /// the mask isn't loaded yet.
-    fn province_at_world_xz(&self, xz: [f32; 2]) -> u32 {
-        let bytes = match &self.province_mask_bytes {
-            Some(b) => b,
-            None => return 0,
-        };
-        let half = WORLD_BOUNDS_HALF_KM;
-        let u = (xz[0] + half) / (2.0 * half);
-        // Y flip mirrors `world_to_world_uv` in shaders/world.wgsl.
-        let v = 1.0 - (xz[1] + half) / (2.0 * half);
-        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
-            return 0;
-        }
-        let w = WORLD_TEX_SIZE;
-        let px = ((u * w as f32) as i32).clamp(0, (w as i32) - 1) as u32;
-        let py = ((v * w as f32) as i32).clamp(0, (w as i32) - 1) as u32;
-        let idx = ((py * w + px) as usize) * 2;
-        let hi = bytes[idx] as u32;
-        let lo = bytes[idx + 1] as u32;
-        hi * 256 + lo
-    }
-
-    /// Upload a fresh 8192² R8Unorm border SDF. Pixel value 0 = on a border;
-    /// 255 = ≥ MAX_DIST_PX away. The shader bilinearly samples and runs it
-    /// through smoothstep to draw smooth, AA'd, thickness-tunable borders.
-    pub fn set_border_sdf(&mut self, width: u32, height: u32, bytes: &[u8]) {
-        if (width, height) != (WORLD_TEX_SIZE, WORLD_TEX_SIZE) {
-            web_sys::console::warn_1(
-                &format!(
-                    "border SDF size mismatch: got {width}x{height}, expected \
-                     {WORLD_TEX_SIZE}\u{00d7}{WORLD_TEX_SIZE}"
-                )
-                .into(),
-            );
-        }
-        let tex = upload_world_texture(
-            &self.gpu,
-            "border_sdf",
-            wgpu::TextureFormat::R8Unorm,
-            width,
-            height,
-            bytes,
-            1, // bytes per pixel
-        );
-        let view = tex.create_view(&Default::default());
-        self.border_sdf_tex = tex;
-        self.border_sdf_view = view;
-        self.rebuild_image_bind_group();
+        changed
     }
 
     /// Upload a fresh 8192² R8Unorm biome mask. Pixel values are biome IDs
@@ -451,9 +685,105 @@ impl Renderer {
             &self.water_mask_view,
             &self.sampler,
             &self.biome_mask_view,
-            &self.province_mask_view,
-            &self.border_sdf_view,
+            &self.settlements_uniform_buf,
+            &self.realm_field.view,
+            &self.world_heightmap_view,
         );
+    }
+
+    /// Re-upload the settlement uniform buffer from the current
+    /// `self.settlements` list and mark the realm-field bake dirty so the
+    /// next frame re-runs it. Call after mutating settlements at runtime.
+    #[allow(dead_code)]
+    pub fn upload_settlements(&mut self) {
+        let data = SettlementUniforms::from_slice(&self.settlements);
+        self.gpu
+            .queue
+            .write_buffer(&self.settlements_uniform_buf, 0, bytemuck::bytes_of(&data));
+        self.realm_field_dirty = true;
+    }
+
+    /// Replace the settlement list (and its realm-name map) and re-upload.
+    /// Used by the asynchronous `cities.json` fetch in `lib.rs` once the
+    /// JSON has been parsed. Truncates to `MAX_SETTLEMENTS` since that's
+    /// what the GPU buffer holds, and rebuilds `realm_infos` so the label
+    /// pass picks up the new realms on the next frame.
+    pub fn set_settlements(&mut self, loaded: LoadedSettlements) {
+        let LoadedSettlements {
+            mut settlements,
+            realm_names,
+        } = loaded;
+        if settlements.len() > MAX_SETTLEMENTS {
+            web_sys::console::warn_1(
+                &format!(
+                    "set_settlements: got {} settlements, truncating to {}",
+                    settlements.len(), MAX_SETTLEMENTS,
+                )
+                .into(),
+            );
+            settlements.truncate(MAX_SETTLEMENTS);
+        }
+        self.settlements = settlements;
+        self.realm_names = realm_names;
+        self.recompute_realm_infos();
+        self.upload_settlements();
+        self.rebuild_realm_label_vertices();
+    }
+
+    /// Re-run the realm rasteriser → PCA → baseline pipeline from the
+    /// current `self.settlements` + the cached water mask (if loaded).
+    /// Both `set_settlements` and `set_water_mask` call this so the
+    /// labels stay correct regardless of asset-load ordering.
+    fn recompute_realm_infos(&mut self) {
+        let wm = self.water_mask_cpu.as_ref().map(|(bytes, w, h)| WaterMask {
+            bytes: bytes.as_slice(),
+            width: *w,
+            height: *h,
+        });
+        self.realm_infos = realm_infos(&self.settlements, &self.realm_names, wm.as_ref());
+    }
+
+    /// Install a freshly loaded SDF glyph atlas. Replaces the
+    /// placeholder texture in the realm-labels bind group and
+    /// re-runs the layout so labels appear on the next frame.
+    pub fn set_glyph_atlas(
+        &mut self,
+        json_text: &str,
+        png_width: u32,
+        png_height: u32,
+        rgba_bytes: &[u8],
+    ) -> Result<(), String> {
+        let atlas = GlyphAtlas::build(
+            &self.gpu, json_text, png_width, png_height, rgba_bytes,
+        )?;
+        self.realm_labels.rebuild_bind_group(
+            &self.gpu,
+            &self.camera_uniform_buf,
+            &atlas.view,
+            &atlas.sampler,
+        );
+        self.glyph_atlas = Some(atlas);
+        // Drop the placeholder once the real atlas owns the bind group
+        // — wgpu keeps the placeholder texture alive via the bind
+        // group's internal refcount, but our explicit handle is no
+        // longer needed.
+        self._placeholder_atlas = None;
+        self.rebuild_realm_label_vertices();
+        Ok(())
+    }
+
+    /// Re-run the label layout from `self.realm_infos` and upload the
+    /// resulting vertex buffer. No-op when the atlas isn't loaded yet.
+    fn rebuild_realm_label_vertices(&mut self) {
+        let Some(atlas) = self.glyph_atlas.as_ref() else {
+            return;
+        };
+        let verts = labels::build_label_vertices(
+            atlas,
+            &self.realm_infos,
+            &LayoutSettings::default(),
+        );
+        self.realm_labels.set_vertices(&self.gpu, &verts);
     }
 }
 
@@ -563,3 +893,26 @@ fn upload_world_texture(
 // selection.
 #[allow(dead_code)]
 const _LAYER_SIZE_REFERENCE: u32 = LAYER_SIZE;
+
+/// Build a `Depth32Float` texture sized to the current swapchain for the
+/// mesh-path image pass. Lives in this module (not `gpu.rs`) because it's
+/// only needed by the image pass, and lifecycle is tied to swapchain
+/// resizes which the Renderer drives.
+fn make_depth(gpu: &GpuContext, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("image depth"),
+        size: wgpu::Extent3d {
+            width: w.max(1),
+            height: h.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: MESH_DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&Default::default());
+    (tex, view)
+}

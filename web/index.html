@@ -6,10 +6,97 @@
   <style>
     html, body { margin: 0; height: 100%; overflow: hidden; background: #000; color: #eee; font-family: monospace; }
     #game { display: block; width: 100vw; height: 100vh; background: #000; }
+
+    /* ---- UI overlay -----------------------------------------------------
+       `#ui-root` covers the viewport with `pointer-events: none` so it
+       doesn't eat the canvas's drag/zoom events. Each interactive child
+       opts back in via `pointer-events: auto`. */
+    #ui-root {
+      position: fixed; inset: 0;
+      pointer-events: none;
+      font-family: system-ui, -apple-system, "Helvetica Neue", sans-serif;
+      color: #eee;
+    }
+    #city-panel {
+      position: absolute; left: 16px; bottom: 16px;
+      min-width: 240px; max-width: 320px;
+      background: rgba(20, 22, 28, 0.86);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      border-radius: 8px;
+      padding: 12px 14px 10px;
+      pointer-events: auto;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+      transform: translateY(8px);
+      opacity: 0;
+      transition: transform 120ms ease-out, opacity 120ms ease-out;
+      visibility: hidden;
+    }
+    #city-panel.visible {
+      transform: translateY(0);
+      opacity: 1;
+      visibility: visible;
+    }
+    #city-panel .header {
+      display: flex; align-items: center; gap: 10px;
+      margin-bottom: 8px;
+    }
+    #city-panel .swatch {
+      width: 14px; height: 14px;
+      border-radius: 3px;
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      flex: 0 0 auto;
+    }
+    #city-panel .name {
+      font-size: 15px; font-weight: 600;
+      flex: 1; min-width: 0;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    #city-panel .close {
+      background: transparent; border: 0;
+      color: #888; cursor: pointer;
+      font-size: 18px; line-height: 1;
+      padding: 0 2px;
+    }
+    #city-panel .close:hover { color: #eee; }
+    #city-panel .row {
+      display: flex; justify-content: space-between;
+      gap: 10px;
+      font-size: 12px;
+      padding: 2px 0;
+      color: #9aa0aa;
+    }
+    #city-panel .row .value {
+      color: #eee;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Realm name labels live in the SDF glyph-atlas render pass
+       (`crate::passes::realm_labels`); they used to be HTML
+       `.realm-label` divs positioned per frame from Rust. */
   </style>
 </head>
 <body>
   <canvas id="game"></canvas>
+  <!--
+    UI overlay layer. Event handlers in lib.rs find these elements by id
+    and toggle them on city click. Markup stays here (rather than being
+    constructed in Rust) so designers can tweak style/structure without
+    touching the wasm side.
+  -->
+  <div id="ui-root" aria-hidden="true">
+    <div id="city-panel" role="dialog" aria-label="City details">
+      <div class="header">
+        <div class="swatch" id="cp-swatch"></div>
+        <div class="name"   id="cp-name">—</div>
+        <button class="close" id="cp-close" aria-label="Close" type="button">×</button>
+      </div>
+      <div class="row"><span>Realm</span>      <span class="value" id="cp-realm">—</span></div>
+      <div class="row"><span>Population</span> <span class="value" id="cp-pop">—</span></div>
+      <div class="row"><span>Position</span>   <span class="value" id="cp-pos">—</span></div>
+    </div>
+  </div>
   <script type="module">
     // ---- WebGPU diagnostics ----
     // These run before the wasm boots, so we get info regardless of whether

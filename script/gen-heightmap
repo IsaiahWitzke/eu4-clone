@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""
+Generate `crates/app/assets/heightmap.png` from cached Mapzen terrain tiles.
+
+Pipeline:
+  1. Look up `crates/app/assets/tiles/z7/{x}_{y}.png` for each tile that
+     covers `WORLD_BBOX`.
+  2. Decode each tile's terrarium RGB encoding to elevation in metres:
+         elevation_m = (R * 256 + G + B / 256) - 32768
+  3. Stitch into a single big float array (raw mercator pixel grid).
+  4. Crop to the exact bbox (tiles extend slightly past the bbox edges)
+     and resample with Lanczos to `WORLD_TEX_SIZE`\u00b2.
+  5. Clip to [0, HEIGHT_SCALE_M] and encode to a 16-bit big-endian PNG.
+     The shader divides by HEIGHT_SCALE_M to get [0, 1] elevation.
+"""
+import math
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _world import ASSETS_DIR, WORLD_BBOX, WORLD_TEX_SIZE  # noqa: E402
+
+ZOOM = 7
+TILE_PX = 256
+TILE_DIR = ASSETS_DIR / "tiles" / f"z{ZOOM}"
+OUT_PNG = ASSETS_DIR / "heightmap.png"
+
+# Must match `HEIGHT_SCALE_M` in `crates/app/src/shaders/world.wgsl`. Anything
+# above this saturates to white (1.0). Europe's max real elevation is ~5642 m
+# (Mt. Elbrus, Caucasus), only marginally inside the bbox; clipping the
+# top hundreds of metres is fine for our purposes.
+HEIGHT_SCALE_M = 5000.0
+
+# Mercator world half-extent (Web-Mercator definition).
+MERC_HALF = 20037508.342789244
+
+
+def tile_range(zoom: int):
+    """Same logic as in `download-heightmap-tiles`; kept inline for clarity."""
+    n = 2 ** zoom
+    span = 2.0 * MERC_HALF
+    xmin, ymin, xmax, ymax = WORLD_BBOX
+
+    def merc_to_tx(x):
+        return int(math.floor((x + MERC_HALF) / span * n))
+
+    def merc_to_ty(y):
+        return int(math.floor((MERC_HALF - y) / span * n))
+
+    return (
+        max(0, merc_to_tx(xmin)),
+        min(n - 1, merc_to_tx(xmax)),
+        max(0, merc_to_ty(ymax)),
+        min(n - 1, merc_to_ty(ymin)),
+    )
+
+
+def main():
+    if not TILE_DIR.exists():
+        sys.exit(
+            f"missing {TILE_DIR}. Run `script/download-heightmap-tiles` first."
+        )
+
+    t0 = time.time()
+    x0, x1, y0, y1 = tile_range(ZOOM)
+    n_x = x1 - x0 + 1
+    n_y = y1 - y0 + 1
+    big_w = n_x * TILE_PX
+    big_h = n_y * TILE_PX
+    print(
+        f"Stitching tile grid x=[{x0}..{x1}] y=[{y0}..{y1}] "
+        f"\u2192 {big_w}\u00d7{big_h} float array"
+    )
+
+    elev = np.zeros((big_h, big_w), dtype=np.float32)
+    n_loaded = 0
+    for ty in range(y0, y1 + 1):
+        for tx in range(x0, x1 + 1):
+            tile_path = TILE_DIR / f"{tx}_{ty}.png"
+            if not tile_path.exists():
+                sys.exit(f"missing tile: {tile_path}")
+            arr = np.asarray(Image.open(tile_path).convert("RGB"))
+            if arr.shape != (TILE_PX, TILE_PX, 3):
+                sys.exit(f"unexpected tile shape {arr.shape} at {tile_path}")
+            r = arr[..., 0].astype(np.int32)
+            g = arr[..., 1].astype(np.int32)
+            b = arr[..., 2].astype(np.int32)
+            # Mapzen terrarium encoding:
+            #   elevation_m = (R * 256 + G + B / 256) - 32768
+            tile_elev = (r * 256 + g + b / 256.0) - 32768.0
+            px = (tx - x0) * TILE_PX
+            py = (ty - y0) * TILE_PX
+            elev[py:py + TILE_PX, px:px + TILE_PX] = tile_elev
+            n_loaded += 1
+    print(
+        f"  loaded {n_loaded} tiles, range {elev.min():.1f} m \u2026 {elev.max():.1f} m"
+    )
+
+    # Crop the stitched array to the actual bbox. Tiles extend slightly past
+    # the bbox on each side because the bbox doesn't align with tile bounds.
+    span = 2.0 * MERC_HALF
+    n = 2 ** ZOOM
+    m_per_px = span / (n * TILE_PX)
+    # Stitched origin (px=0, py=0) corresponds to:
+    x_left = (x0 / n - 0.5) * span
+    y_top = (0.5 - y0 / n) * span
+    xmin, ymin, xmax, ymax = WORLD_BBOX
+    left = (xmin - x_left) / m_per_px
+    right = (xmax - x_left) / m_per_px
+    top = (y_top - ymax) / m_per_px
+    bottom = (y_top - ymin) / m_per_px
+    li, ri = int(round(left)), int(round(right))
+    ti, bi = int(round(top)), int(round(bottom))
+    print(
+        f"Cropping to bbox: stitched[{ti}:{bi}, {li}:{ri}] "
+        f"({bi - ti}\u00d7{ri - li} px, {m_per_px:.1f} m/px)"
+    )
+    cropped = elev[ti:bi, li:ri]
+
+    # Resample to WORLD_TEX_SIZE\u00b2 with Lanczos for quality. PIL handles 32-bit
+    # float images via mode='F'.
+    print(f"Resampling to {WORLD_TEX_SIZE}\u00b2 (Lanczos)...")
+    img_f = Image.fromarray(cropped, mode="F")
+    img_resized = img_f.resize(
+        (WORLD_TEX_SIZE, WORLD_TEX_SIZE), Image.LANCZOS
+    )
+    resampled = np.asarray(img_resized, dtype=np.float32)
+    print(
+        f"  resampled range {resampled.min():.1f} m \u2026 {resampled.max():.1f} m"
+    )
+
+    # Clip to [0, HEIGHT_SCALE_M] and encode to 16-bit big-endian PNG.
+    clipped = np.clip(resampled, 0.0, HEIGHT_SCALE_M)
+    encoded = (clipped / HEIGHT_SCALE_M * 65535.0).round().astype(np.uint16)
+
+    print(f"Saving \u2192 {OUT_PNG} (16-bit big-endian grayscale)")
+    out_img = Image.new("I;16B", (WORLD_TEX_SIZE, WORLD_TEX_SIZE))
+    out_img.frombytes(encoded.astype(">u2").tobytes())
+    out_img.save(OUT_PNG, optimize=True)
+    size_kb = OUT_PNG.stat().st_size / 1024
+    print(f"  wrote {OUT_PNG} ({size_kb:.0f} KiB)")
+    print(f"done in {time.time() - t0:.1f}s")
+
+
+if __name__ == "__main__":
+    main()

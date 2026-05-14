@@ -1,3 +1,18 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/app"]
 resolver = "2"
+
+# Build profile that ships full DWARF debug info in the wasm binary so
+# Chrome DevTools (with the "C/C++ DevTools Support (DWARF)" extension
+# installed) can show real Rust function names in the Performance flame
+# chart instead of `wasm-function[12345]`.
+#
+# Use it via:
+#   PROFILE=profiling ./script/build-wasm
+#
+# The resulting .wasm is much larger than `release` (often 5-10×) — only
+# build this way when you actually want to profile.
+[profile.profiling]
+inherits = "release"
+debug = "full"
+strip = "none"
