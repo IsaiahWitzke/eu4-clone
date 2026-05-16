@@ -21,10 +21,110 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use web_sys::console;
 
-use crate::camera::HOVER_PICK_Y;
+use crate::camera::{HOVER_PICK_Y, MAX_CAMERA_DISTANCE, MAX_CAMERA_TILT, MIN_CAMERA_DISTANCE, MIN_CAMERA_TILT};
 use crate::gpu::canvas_by_id;
 use crate::renderer::Renderer;
 use crate::ui::CityPanel;
+
+/// Total number of runtime PNG assets the renderer cares about for a
+/// terrain screenshot. When the counter inside `run()` hits zero, the
+/// harness signal `window.__eu4_ready = true` is set so an external
+/// screenshot driver (see `script/screenshot`) can grab the canvas.
+const SCREENSHOT_ASSET_COUNT: u32 = 3;
+
+/// Apply query-string overrides for the initial camera position. Supported
+/// keys (all optional, all floats in world km / radians):
+///   * `cx`, `cz`      — `world_center` in km
+///   * `dist`          — camera distance in km
+///   * `tilt`          — camera tilt in radians (0 = top-down)
+///
+/// Used by the headless screenshot harness to drive the camera without
+/// any wasm-side mutation API. Unknown keys are ignored so future
+/// additions don't have to be co-ordinated across both sides.
+fn apply_url_camera_overrides(renderer: &mut Renderer) {
+    let Some(search) = web_sys::window().and_then(|w| w.location().search().ok()) else {
+        return;
+    };
+    if search.is_empty() {
+        return;
+    }
+    // Strip the leading '?'. `URLSearchParams` would be the “right”
+    // answer here but pulling in a whole web-sys feature for that is
+    // overkill — we only support a handful of float keys.
+    let qs = search.strip_prefix('?').unwrap_or(&search);
+    let mut cx: Option<f32> = None;
+    let mut cz: Option<f32> = None;
+    let mut dist: Option<f32> = None;
+    let mut tilt: Option<f32> = None;
+    for pair in qs.split('&') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        let Ok(v) = v.parse::<f32>() else { continue };
+        match k {
+            "cx" => cx = Some(v),
+            "cz" => cz = Some(v),
+            "dist" => dist = Some(v),
+            "tilt" => tilt = Some(v),
+            _ => {}
+        }
+    }
+    let cam = renderer.camera_mut();
+    if let Some(x) = cx {
+        cam.world_center[0] = x;
+    }
+    if let Some(z) = cz {
+        cam.world_center[1] = z;
+    }
+    if let Some(d) = dist {
+        cam.distance = d.clamp(MIN_CAMERA_DISTANCE, MAX_CAMERA_DISTANCE);
+    }
+    if let Some(t) = tilt {
+        cam.tilt = t.clamp(MIN_CAMERA_TILT, MAX_CAMERA_TILT);
+    }
+    console::log_1(
+        &format!(
+            "camera overrides applied: center=({:.1}, {:.1}) dist={:.1} tilt={:.3}",
+            cam.world_center[0], cam.world_center[1], cam.distance, cam.tilt
+        )
+        .into(),
+    );
+}
+
+/// Mark the page as “ready for screenshotting”. Sets two globals on
+/// `window`:
+///   * `__eu4_ready = true`
+///   * `__eu4_ready_at = performance.now()` (handy for debugging
+///     race conditions in the harness)
+///
+/// Idempotent — only the first call has any effect, so callers can
+/// flush it after each frame without worrying about double-signalling.
+fn mark_screenshot_ready() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    // Don’t re-signal once set; some downstream tooling might be
+    // watching for the *transition* false→true.
+    let already = js_sys::Reflect::get(&window, &JsValue::from_str("__eu4_ready"))
+        .map(|v| v.as_bool().unwrap_or(false))
+        .unwrap_or(false);
+    if already {
+        return;
+    }
+    let _ = js_sys::Reflect::set(
+        &window,
+        &JsValue::from_str("__eu4_ready"),
+        &JsValue::from_bool(true),
+    );
+    if let Some(perf) = window.performance() {
+        let _ = js_sys::Reflect::set(
+            &window,
+            &JsValue::from_str("__eu4_ready_at"),
+            &JsValue::from_f64(perf.now()),
+        );
+    }
+    console::log_1(&"__eu4_ready = true".into());
+}
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -45,9 +145,7 @@ pub fn start() {
 /// real work runs at rAF cadence (≤ display refresh).
 ///
 /// At the end of each rAF callback we call back into `schedule_frame`
-/// so frames keep flowing even when there's no user input. This keeps
-/// the spinner overlay spinning so its smoothness reflects whether
-/// `frame()` is paced by the display refresh or by our own work.
+/// so frames keep flowing even when there's no user input.
 fn schedule_frame(
     renderer: &Rc<RefCell<Renderer>>,
     pending: &Rc<Cell<bool>>,
@@ -94,7 +192,7 @@ fn schedule_frame(
         // `schedule_frame` means stacking calls from event handlers
         // (mousemove, wheel, keydown, …) still coalesces to one rAF
         // per refresh — this call just keeps the loop going when no
-        // events fire, so the spinner overlay keeps animating.
+        // events fire.
         schedule_frame(&r, &p, &lm, &dr);
     });
     web_sys::window()
@@ -106,7 +204,18 @@ fn schedule_frame(
 async fn run() {
     let canvas = canvas_by_id("game");
     let renderer = Rc::new(RefCell::new(Renderer::new(canvas).await));
-    renderer.borrow_mut().frame();
+    {
+        let mut rb = renderer.borrow_mut();
+        apply_url_camera_overrides(&mut rb);
+        rb.frame();
+    }
+
+    // Counts down from `SCREENSHOT_ASSET_COUNT` as each asset PNG
+    // (heightmap, water mask, biome mask) finishes loading + applying.
+    // When it reaches zero we flip `window.__eu4_ready` so the
+    // headless screenshot harness can grab the canvas. Lives in an
+    // `Rc<Cell<_>>` so each `spawn_load` closure can clone it.
+    let ready_remaining: Rc<Cell<u32>> = Rc::new(Cell::new(SCREENSHOT_ASSET_COUNT));
 
     // ---- UI overlay -----------------------------------------------------
     // The HTML-side markup lives in `web/index.html`; we just hold cached
@@ -347,23 +456,25 @@ async fn run() {
 
     // Kick off the continuous rAF loop. From here on the rAF callback
     // tail-chains itself, so `frame()` runs once per display refresh
-    // even when no input events fire. This drives the spinner overlay's
-    // smoothness as a live frame-pacing indicator.
+    // even when no input events fire.
     schedule_frame(&renderer, &pending, &latest_mouse, &dragging);
 
     // ---- Async asset loading --------------------------------------------
     spawn_load(
         renderer.clone(),
+        ready_remaining.clone(),
         "./heightmap.png",
         |r, decoded| r.set_world_heightmap(decoded.width, decoded.height, &decoded.bytes),
     );
     spawn_load(
         renderer.clone(),
+        ready_remaining.clone(),
         "./water_mask.png",
         |r, decoded| r.set_water_mask(decoded.width, decoded.height, &decoded.bytes),
     );
     spawn_load(
         renderer.clone(),
+        ready_remaining.clone(),
         "./biome_mask.png",
         |r, decoded| r.set_biome_mask(decoded.width, decoded.height, &decoded.bytes),
     );
@@ -448,8 +559,13 @@ async fn run() {
 
 /// Spawn a `fetch + decode + apply` task. `apply` mutates the renderer with
 /// the decoded bytes; we then trigger one frame so the user sees the new data.
+///
+/// `ready_remaining` is a shared counter; each successful apply decrements
+/// it and, when it reaches zero, flips `window.__eu4_ready = true` so the
+/// headless screenshot harness in `script/screenshot` can grab the canvas.
 fn spawn_load(
     renderer: Rc<RefCell<Renderer>>,
+    ready_remaining: Rc<Cell<u32>>,
     url: &'static str,
     apply: fn(&mut Renderer, &assets::DecodedPng),
 ) {
@@ -470,6 +586,17 @@ fn spawn_load(
                 let mut rb = renderer.borrow_mut();
                 apply(&mut rb, &decoded);
                 rb.frame();
+                drop(rb);
+
+                let left = ready_remaining.get().saturating_sub(1);
+                ready_remaining.set(left);
+                if left == 0 {
+                    // One more frame to make sure the atlas bake (queued by
+                    // `apply` via `atlases_dirty = true`) has actually run
+                    // before we tell the harness to screenshot.
+                    renderer.borrow_mut().frame();
+                    mark_screenshot_ready();
+                }
             }
             Err(err) => {
                 console::error_1(&format!("failed to load {url}: {err:?}").into());

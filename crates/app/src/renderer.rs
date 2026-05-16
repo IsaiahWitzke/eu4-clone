@@ -9,11 +9,10 @@
 //!   4. `world_mesh` draw — heightmap-displaced grid sampling the
 //!      LoD atlases + realm-field tint
 //!   5. realm-name labels (SDF glyph overlay)
-//!   6. frame-pacing spinner overlay
-//!   7. submit / present
+//!   6. submit / present
 
 use bytemuck;
-use web_sys::{HtmlCanvasElement, Performance};
+use web_sys::HtmlCanvasElement;
 
 use crate::camera::{CAMERA_FOV_Y_RAD, Camera, CameraUniforms, HOVER_PICK_Y};
 use crate::gpu::{GpuContext, compute_canvas_size};
@@ -21,7 +20,6 @@ use crate::labels::{self, GlyphAtlas, LayoutSettings};
 use crate::passes::{
     realm_field as realm_field_pass, realm_field::RealmFieldPass,
     realm_labels::{self as realm_labels_pass, RealmLabelsPass},
-    spinner::{self as spinner_pass, SpinnerPass},
     tile_bake::{self as tile_bake_pass, TileBakePass},
     world_mesh::{self as world_mesh_pass, MESH_DEPTH_FORMAT, WorldMeshPass},
 };
@@ -70,11 +68,6 @@ pub struct Renderer {
     _placeholder_atlas: Option<(wgpu::Texture, wgpu::TextureView, wgpu::Sampler)>,
     realm_labels: RealmLabelsPass,
 
-    performance: Performance,
-
-    spinner: SpinnerPass,
-    start_time_ms: f64,
-
     /// Tile-bake pass + the four LoD atlases it writes into.
     tile_bake: TileBakePass,
     /// True until the next `frame()` re-bakes all atlases. Set by any
@@ -94,11 +87,6 @@ pub struct Renderer {
 impl Renderer {
     pub async fn new(canvas: HtmlCanvasElement) -> Self {
         let gpu = GpuContext::new(canvas).await;
-
-        let performance = web_sys::window()
-            .expect("no window")
-            .performance()
-            .expect("no performance");
 
         let camera = Camera::new();
         let camera_uniform_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -186,9 +174,6 @@ impl Renderer {
             gpu.swapchain_format,
         );
 
-        let spinner = spinner_pass::build(&gpu, gpu.swapchain_format);
-        let start_time_ms = performance.now();
-
         web_sys::console::log_1(
             &format!(
                 "renderer ready: tile pyramid will bake {} tiles across 4 LoDs once assets load",
@@ -218,9 +203,6 @@ impl Renderer {
             glyph_atlas: None,
             _placeholder_atlas: Some(placeholder_atlas),
             realm_labels,
-            performance,
-            spinner,
-            start_time_ms,
             tile_bake,
             atlases_dirty: true,
             world_mesh,
@@ -284,10 +266,15 @@ impl Renderer {
         let mut encoder = self.gpu.encoder("frame");
 
         // Realm-field bake — fires whenever settlements changed.
-        if self.realm_field_dirty {
-            self.realm_field.render(&mut encoder);
-            self.realm_field_dirty = false;
-        }
+        // TEMPORARY: disabled while iterating on map look. The world
+        // mesh shader still binds the (placeholder/last-baked) realm
+        // field texture, but the tint sampling in the fragment shader
+        // is commented out, so this bake is wasted work.
+        // if self.realm_field_dirty {
+        //     self.realm_field.render(&mut encoder);
+        //     self.realm_field_dirty = false;
+        // }
+        let _ = &self.realm_field_dirty;
 
         // Tile atlas bake — fires once after each asset PNG lands.
         if self.atlases_dirty {
@@ -303,13 +290,10 @@ impl Renderer {
             .render(&mut encoder, &frame_view, &self.depth_view);
 
         // Realm-name overlay.
-        self.realm_labels.render(&mut encoder, &frame_view);
-
-        // Spinner.
-        let time_s = ((self.performance.now() - self.start_time_ms) / 1000.0) as f32;
-        self.spinner
-            .write_uniforms(&self.gpu, time_s, self.gpu.width, self.gpu.height);
-        self.spinner.render(&mut encoder, &frame_view);
+        // TEMPORARY: disabled while iterating on map look — no
+        // country labels on top of the terrain for now.
+        // self.realm_labels.render(&mut encoder, &frame_view);
+        let _ = &self.realm_labels;
 
         self.gpu.submit(encoder);
 

@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Headless screenshot harness — renders the current build of the game in
+# real Chrome and writes a PNG of the canvas. Designed for an agent loop
+# where you iterate on map appearance:
+#
+#   $ ./script/screenshot --output /tmp/map.png
+#   $ # edit shaders, run again, eyeball the new PNG...
+#
+# Camera position is controlled by query-string params the wasm parses
+# in `lib.rs::apply_url_camera_overrides`:
+#   --cx FLOAT     world_center.x in km (default 0)
+#   --cz FLOAT     world_center.z in km (default 0)
+#   --dist FLOAT   camera distance in km (default 3000 — full world)
+#   --tilt FLOAT   tilt in radians 0..π/2 (default 0.27)
+#   --width INT    viewport width  in CSS px (default 1280)
+#   --height INT   viewport height in CSS px (default 800)
+#   --output PATH  output PNG (default screenshot.png in cwd)
+#   --url URL      override the page URL (default http://127.0.0.1:8091)
+#   --port INT     port for the auto-started server (default 8091)
+#   --skip-build   don't rebuild the wasm before screenshotting
+#   --no-serve     don't auto-launch `script/serve` — assume one's running
+#   --keep-open    leave Chrome's user-data dir around for debugging
+#   --timeout SEC  how long to wait for window.__eu4_ready (default 30)
+#
+# Pipeline:
+#   1. Build the wasm (unless --skip-build).
+#   2. Auto-start `script/serve` in the background if nothing's listening
+#      on the chosen port; tear it down on exit.
+#   3. npm install puppeteer-core into `script/_screenshot/` on first run.
+#   4. node screenshot.mjs ... → PNG written to --output.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+HARNESS_DIR="$ROOT/script/_screenshot"
+
+# Defaults — passed through to screenshot.mjs verbatim.
+PORT="${PORT:-8091}"
+SKIP_BUILD=0
+NO_SERVE=0
+PASS_ARGS=()
+URL_OVERRIDE=""
+OUTPUT=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --skip-build)  SKIP_BUILD=1; shift ;;
+    --no-serve)    NO_SERVE=1; shift ;;
+    --port)        PORT="$2"; shift 2 ;;
+    --url)         URL_OVERRIDE="$2"; shift 2 ;;
+    --output)      OUTPUT="$2"; PASS_ARGS+=("--output" "$2"); shift 2 ;;
+    --cx|--cz|--dist|--tilt|--width|--height|--timeout)
+                   PASS_ARGS+=("$1" "$2"); shift 2 ;;
+    --keep-open)   PASS_ARGS+=("--keep-open"); shift ;;
+    -h|--help)
+      sed -n '1,40p' "$0"; exit 0 ;;
+    *)
+      echo "screenshot: unknown arg $1" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$URL_OVERRIDE" ]; then
+  URL="http://127.0.0.1:${PORT}/"
+else
+  URL="$URL_OVERRIDE"
+fi
+PASS_ARGS+=("--url" "$URL")
+
+# ---- 1. Build the wasm ------------------------------------------------------
+if [ "$SKIP_BUILD" -eq 0 ]; then
+  "$ROOT/script/build-wasm"
+fi
+
+# ---- 2. Maybe spin up the static server ------------------------------------
+SERVER_PID=""
+cleanup() {
+  if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+if [ "$NO_SERVE" -eq 0 ] && [ -z "$URL_OVERRIDE" ]; then
+  # Probe for an existing listener on the port. `nc -z` returns 0 if
+  # something's already accepting connections, in which case we leave it
+  # alone (the user might already have `script/serve` running in another
+  # terminal).
+  if ! nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+    echo "screenshot: starting server on :${PORT}" >&2
+    "$ROOT/script/serve" "$PORT" >/dev/null 2>&1 &
+    SERVER_PID=$!
+    # Wait up to 5s for the server to start accepting.
+    for _ in $(seq 1 50); do
+      if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then break; fi
+      sleep 0.1
+    done
+    if ! nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+      echo "screenshot: server failed to come up on :${PORT}" >&2
+      exit 1
+    fi
+  fi
+fi
+
+# ---- 3. npm install (only on first run) ------------------------------------
+if [ ! -d "$HARNESS_DIR/node_modules" ]; then
+  echo "screenshot: installing node deps in $HARNESS_DIR" >&2
+  (cd "$HARNESS_DIR" && npm install --silent --no-audit --no-fund)
+fi
+
+# ---- 4. Run the puppeteer driver -------------------------------------------
+cd "$HARNESS_DIR"
+exec node screenshot.mjs "${PASS_ARGS[@]}"

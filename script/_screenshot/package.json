@@ -1,0 +1,10 @@
+{
+  "name": "eu4-screenshot-harness",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Headless Chrome harness for screenshotting eu4-clone. Driver lives in screenshot.mjs; invoked by ../screenshot.",
+  "type": "module",
+  "dependencies": {
+    "puppeteer-core": "^23.0.0"
+  }
+}

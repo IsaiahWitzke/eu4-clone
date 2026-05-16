@@ -6,7 +6,6 @@
 //!   * `realm_field` bakes the per-pixel argmax-realm texture (driven by
 //!     `set_settlements`).
 //!   * `realm_labels` draws the SDF-glyph country-name overlay.
-//!   * `spinner` draws the in-corner frame-pacing diagnostic.
 //!
 //! World rendering is now a two-stage pipeline:
 //!   * `tile_bake` (once after assets land) writes the 4 LoD atlases.
@@ -15,6 +14,5 @@
 
 pub mod realm_field;
 pub mod realm_labels;
-pub mod spinner;
 pub mod tile_bake;
 pub mod world_mesh;

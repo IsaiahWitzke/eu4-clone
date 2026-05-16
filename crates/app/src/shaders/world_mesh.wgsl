@@ -223,24 +223,27 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(lod_color, 1.0);
     }
 
-    var color = sample_atlas(lod, uv);
+    let color = sample_atlas(lod, uv);
 
-    // Realm tint from the pre-baked field.
-    let field_px_f = uv * REALM_FIELD_SIZE;
-    let field_px   = clamp(vec2<i32>(field_px_f),
-                           vec2<i32>(0),
-                           vec2<i32>(i32(REALM_FIELD_SIZE) - 1));
-    let field      = textureLoad(realm_field, field_px, 0);
-    let realm_id   = u32(round(field.r));
-    let field_a    = field.g; // alpha — 0 in wilderness, ~1 deep interior
-    let realm_rgb  = realm_palette(realm_id);
-
-    // Highlight the hovered realm with a brighter tint.
-    var tint_strength = field_a * 0.35;
-    if (camera.hovered_pid != 0u && realm_id + 1u == camera.hovered_pid) {
-        tint_strength = field_a * 0.55;
-    }
-    color = mix(color, color * 0.55 + realm_rgb * 0.55, tint_strength);
+    // TEMPORARY: country/realm tinting disabled while iterating on
+    // map look. The realm_field texture binding is still present (the
+    // bind-group layout still requires it) — we just don't sample it.
+    // The realm_palette helper and hover-highlight branch are kept in
+    // source so re-enabling is a single block uncomment.
+    //
+    // let field_px_f = uv * REALM_FIELD_SIZE;
+    // let field_px   = clamp(vec2<i32>(field_px_f),
+    //                        vec2<i32>(0),
+    //                        vec2<i32>(i32(REALM_FIELD_SIZE) - 1));
+    // let field      = textureLoad(realm_field, field_px, 0);
+    // let realm_id   = u32(round(field.r));
+    // let field_a    = field.g;
+    // let realm_rgb  = realm_palette(realm_id);
+    // var tint_strength = field_a * 0.35;
+    // if (camera.hovered_pid != 0u && realm_id + 1u == camera.hovered_pid) {
+    //     tint_strength = field_a * 0.55;
+    // }
+    // color = mix(color, color * 0.55 + realm_rgb * 0.55, tint_strength);
 
     return vec4<f32>(color, 1.0);
 }
