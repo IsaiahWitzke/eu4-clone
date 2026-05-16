@@ -114,12 +114,7 @@ pub fn build(gpu: &GpuContext, settlements_uniform_buf: &wgpu::Buffer) -> RealmF
 
 impl RealmFieldPass {
     /// Run the bake into our owned texture. Caller queues the encoder.
-    /// `timestamp_writes` brackets the bake for GPU profiling.
-    pub fn render(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
-    ) {
+    pub fn render(&self, encoder: &mut wgpu::CommandEncoder) {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("realm_field bake"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -132,7 +127,7 @@ impl RealmFieldPass {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes,
+            timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
         });

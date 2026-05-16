@@ -8,25 +8,19 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PROFILE="${PROFILE:-release}"
 
 cd "$ROOT"
 
 # 1. Compile the binary crate to wasm.
-cargo build --target wasm32-unknown-unknown --profile "$PROFILE" -p eu4-app
+cargo build --target wasm32-unknown-unknown --release -p eu4-app
 
-# 2. Run wasm-bindgen on the resulting .wasm file. We pass `--keep-debug`
-#    unconditionally: when the cargo profile didn't emit DWARF (the
-#    default `release` case) it's a no-op, but with `PROFILE=profiling`
-#    the DWARF section survives into the final wasm so Chrome DevTools
-#    can symbolicate Rust frames in the Performance flame chart.
-WASM_INPUT="target/wasm32-unknown-unknown/${PROFILE}/eu4_app.wasm"
+# 2. Run wasm-bindgen on the resulting .wasm file.
+WASM_INPUT="target/wasm32-unknown-unknown/release/eu4_app.wasm"
 wasm-bindgen \
   --target web \
   --out-dir dist \
   --out-name app \
   --no-typescript \
-  --keep-debug \
   "$WASM_INPUT"
 
 # 3. Copy the hand-written HTML into dist/.

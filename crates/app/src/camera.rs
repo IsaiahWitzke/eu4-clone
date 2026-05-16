@@ -95,13 +95,19 @@ pub enum MapMode {
     #[default]
     Terrain = 0,
     Political = 1,
+    /// Debug overlay: shade each fragment by which LoD atlas the
+    /// world_mesh fragment shader sampled. Press M to cycle into this
+    /// mode — lets you see at a glance whether LoD selection is
+    /// actually switching as you zoom.
+    DebugLod = 2,
 }
 
 impl MapMode {
     pub fn next(self) -> Self {
         match self {
             Self::Terrain => Self::Political,
-            Self::Political => Self::Terrain,
+            Self::Political => Self::DebugLod,
+            Self::DebugLod => Self::Terrain,
         }
     }
 }

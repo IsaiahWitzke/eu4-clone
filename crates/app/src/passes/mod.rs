@@ -1,11 +1,20 @@
 //! Per-pass modules. Each module owns the pipeline + bind groups for one
-//! shader stage and exposes a constructor that returns either a `WorldLayer`
-//! (for cached world-anchored data) or a custom `Pass` struct (for the image
-//! pass, which renders to swapchain).
+//! shader stage and exposes its own constructor.
+//!
+//! After the tile-pyramid rewrite the surface area is much smaller than
+//! it used to be:
+//!   * `realm_field` bakes the per-pixel argmax-realm texture (driven by
+//!     `set_settlements`).
+//!   * `realm_labels` draws the SDF-glyph country-name overlay.
+//!   * `spinner` draws the in-corner frame-pacing diagnostic.
+//!
+//! World rendering is now a two-stage pipeline:
+//!   * `tile_bake` (once after assets land) writes the 4 LoD atlases.
+//!   * `world_mesh` (per frame) rasterises a heightmap-displaced grid
+//!     and samples the appropriate atlas + realm-field.
 
-pub mod base_heightmap;
-pub mod detail_noise;
-pub mod erosion;
-pub mod image;
 pub mod realm_field;
 pub mod realm_labels;
+pub mod spinner;
+pub mod tile_bake;
+pub mod world_mesh;
