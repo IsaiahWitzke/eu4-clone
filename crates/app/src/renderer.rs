@@ -48,10 +48,14 @@ pub struct Renderer {
     /// (reads heightmap for vertex displacement) reference these.
     world_heightmap_tex: wgpu::Texture,
     world_heightmap_view: wgpu::TextureView,
-    water_mask_tex: wgpu::Texture,
-    water_mask_view: wgpu::TextureView,
-    /// CPU copy of the water-mask bytes so the realm rasteriser can
-    /// drop offshore cells.
+    /// Water SDF — the GPU-side coastline distance field that drives
+    /// land/water blending and (eventually) coastline ink, shelf
+    /// gradients, and ring contours. See `script/gen-water-sdf`.
+    water_sdf_tex: wgpu::Texture,
+    water_sdf_view: wgpu::TextureView,
+    /// CPU copy of the binary water-mask bytes so the realm rasteriser
+    /// can drop offshore cells. We keep loading `water_mask.png`
+    /// solely for this; the bake shader has moved over to the SDF.
     water_mask_cpu: Option<(Vec<u8>, u32, u32)>,
     biome_mask_tex: wgpu::Texture,
     biome_mask_view: wgpu::TextureView,
@@ -112,8 +116,13 @@ impl Renderer {
         // not-very-interesting atlas; the first PNG arrival re-bakes.
         let (world_heightmap_tex, world_heightmap_view) =
             placeholder_rg8unorm(&gpu, "world_heightmap (placeholder)");
-        let (water_mask_tex, water_mask_view) =
-            placeholder_r8unorm(&gpu, "water_mask (placeholder)");
+        // Placeholder SDF: a single texel of byte=128, which decodes
+        // to distance ≈ 0 — i.e. “everything is on the coast.” That
+        // produces a uniformly half-water world for the brief moment
+        // before the real SDF lands; harmless.
+        let (water_sdf_tex, water_sdf_view) =
+            placeholder_texture(&gpu, "water_sdf (placeholder)",
+                                wgpu::TextureFormat::R8Unorm, &[128u8]);
         let (biome_mask_tex, biome_mask_view) =
             placeholder_r8unorm(&gpu, "biome_mask (placeholder)");
 
@@ -136,16 +145,18 @@ impl Renderer {
 
         // Tile-bake pass — owns the four atlases. Bind groups reference
         // the placeholder views right now; rebuilt when real PNGs land.
+        // Note: no water_sdf here — the bake now produces pure terrain,
+        // and the SDF is consumed per-frame by `world_mesh` instead.
         let tile_bake = tile_bake_pass::build(
             &gpu,
             &world_heightmap_view,
-            &water_mask_view,
             &biome_mask_view,
             &sampler,
         );
 
-        // World-mesh pass — references the atlases (stable lifetimes)
-        // and the heightmap view (rebuilt on PNG arrival).
+        // World-mesh pass — references the atlases (stable lifetimes),
+        // the heightmap view (rebuilt on PNG arrival), and the water
+        // SDF (also rebuilt on PNG arrival).
         let atlas_views_ref: [&wgpu::TextureView; 4] = [
             &tile_bake.atlas_views[0],
             &tile_bake.atlas_views[1],
@@ -159,6 +170,7 @@ impl Renderer {
             atlas_views_ref,
             &sampler,
             &realm_field.view,
+            &water_sdf_view,
             gpu.swapchain_format,
         );
 
@@ -189,8 +201,8 @@ impl Renderer {
             sampler,
             world_heightmap_tex,
             world_heightmap_view,
-            water_mask_tex,
-            water_mask_view,
+            water_sdf_tex,
+            water_sdf_view,
             water_mask_cpu: None,
             biome_mask_tex,
             biome_mask_view,
@@ -331,7 +343,11 @@ impl Renderer {
         self.atlases_dirty = true;
     }
 
-    /// Upload a fresh water mask + CPU-side copy for the realm rasteriser.
+    /// Stash the binary water-mask bytes on the CPU side for the realm
+    /// rasteriser. We no longer upload these to the GPU — the bake
+    /// shader has switched to the signed-distance field (`set_water_sdf`)
+    /// which encodes the same coastline at the same source resolution
+    /// but is filterable into sub-texel smooth edges.
     pub fn set_water_mask(&mut self, width: u32, height: u32, bytes: &[u8]) {
         if (width, height) != (WORLD_TEX_SIZE, WORLD_TEX_SIZE) {
             web_sys::console::warn_1(
@@ -342,9 +358,29 @@ impl Renderer {
                 .into(),
             );
         }
+        self.water_mask_cpu = Some((bytes.to_vec(), width, height));
+        self.recompute_realm_infos();
+        self.rebuild_realm_label_vertices();
+    }
+
+    /// Upload a fresh water SDF and re-point the world_mesh pass at
+    /// it. Note: the bake doesn't see the SDF anymore — the per-frame
+    /// world_mesh shader is the only consumer, where the SDF drives
+    /// screen-pixel-accurate coastline AA + shelf gradient. See
+    /// `script/gen-water-sdf` for the encoding.
+    pub fn set_water_sdf(&mut self, width: u32, height: u32, bytes: &[u8]) {
+        if (width, height) != (WORLD_TEX_SIZE, WORLD_TEX_SIZE) {
+            web_sys::console::warn_1(
+                &format!(
+                    "water SDF size mismatch: got {width}x{height}, expected \
+                     {WORLD_TEX_SIZE}\u{00d7}{WORLD_TEX_SIZE}"
+                )
+                .into(),
+            );
+        }
         let tex = upload_world_texture(
             &self.gpu,
-            "water_mask",
+            "water_sdf",
             wgpu::TextureFormat::R8Unorm,
             width,
             height,
@@ -352,15 +388,10 @@ impl Renderer {
             1,
         );
         let view = tex.create_view(&Default::default());
-        self.water_mask_tex = tex;
-        self.water_mask_view = view;
+        self.water_sdf_tex = tex;
+        self.water_sdf_view = view;
 
-        self.rebuild_bake_bind_groups();
-        self.atlases_dirty = true;
-
-        self.water_mask_cpu = Some((bytes.to_vec(), width, height));
-        self.recompute_realm_infos();
-        self.rebuild_realm_label_vertices();
+        self.rebuild_world_mesh_bind_group();
     }
 
     pub fn update_hover(&mut self, mx: f32, my: f32, css_w: f32, css_h: f32) -> bool {
@@ -417,7 +448,6 @@ impl Renderer {
         self.tile_bake.rebuild_bind_groups(
             &self.gpu.device,
             &self.world_heightmap_view,
-            &self.water_mask_view,
             &self.biome_mask_view,
             &self.sampler,
         );
@@ -438,6 +468,7 @@ impl Renderer {
             atlas_views_ref,
             &self.sampler,
             &self.realm_field.view,
+            &self.water_sdf_view,
         );
     }
 

@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""
+Generate `crates/app/assets/water_sdf.png` — a signed distance field
+encoding *how far each pixel is from the nearest coastline*, in km.
+
+Why this exists:
+  The binary `water_mask.png` (1.0 = water, 0.0 = land) has a hard
+  edge that quantises to its 4096² grid → ~1.34 km/texel. When the
+  bake shader does `mix(land, water, smoothstep(0.3, 0.7, mask))`
+  the resulting coastline traces a chain of axis-aligned segments
+  on that grid, which the user sees as the staircase / pixelation
+  at close zoom.
+
+  An SDF stores a *continuous* signed distance instead of a binary
+  value. The GPU's built-in bilinear filter then reconstructs the
+  zero-crossing at any sub-texel position, and `fwidth`-based AA in
+  the shader produces a one-screen-pixel-wide transition no matter
+  how zoomed in we are. See the conversation history for the full
+  why; this script is the "convert binary → SDF" half.
+
+Encoding:
+  * Input  : `water_mask.png` (R8, threshold at 128 → binary).
+  * Output : `water_sdf.png`  (R8, distance in km mapped linearly
+             to [0, 255] over the band [-SDF_RANGE_KM, +SDF_RANGE_KM]).
+  * Sign convention: NEGATIVE inside water, POSITIVE on land, zero
+    exactly on the coast.
+  * Range : ±8 km. Past that the value is clamped — we don't care
+    about precision deep inland or deep at sea, only near the
+    coast where ink / shallow water / coastline halos live.
+  * Precision near zero: 16 km / 256 ≈ 62 m. Plenty for any
+    coastal effect we want.
+
+Why R8 and not R16:
+  * R8 is filterable in every wgpu backend including the WebGL2
+    fallback — the same path the heightmap and water mask already
+    use, no new format-support checks.
+  * 16-bit storage would only buy us better precision *far* from
+    the coast, where we have already chosen to clamp.
+  * 4096² × 1 byte = 16 MB raw, ~3-4 MB after PNG compression.
+
+Algorithm:
+  scipy.ndimage.distance_transform_edt computes the unsigned
+  Euclidean distance from each pixel to the nearest zero pixel.
+  Run it twice — once with land=0 to get "distance to land" on
+  water pixels, once with water=0 to get "distance to water" on
+  land pixels — then assemble the signed field.
+
+This script depends on `crates/app/assets/water_mask.png` already
+existing (run `script/gen-water-mask` first if it doesn't).
+"""
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+try:
+    from scipy.ndimage import distance_transform_edt
+except ImportError:
+    sys.exit(
+        "gen-water-sdf needs scipy. Install with:\n"
+        "    python3 -m pip install --break-system-packages scipy"
+    )
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _world import ASSETS_DIR, WORLD_TEX_SIZE, bbox_size_m  # noqa: E402
+
+WATER_MASK_PNG = ASSETS_DIR / "water_mask.png"
+WATER_SDF_PNG = ASSETS_DIR / "water_sdf.png"
+
+# Distance range stored in the SDF, in km. Distances beyond ±SDF_RANGE_KM
+# are clamped to the boundary. Pick this small enough that R8 precision
+# (~62 m/byte) is comfortable for the coastal-effects band, but large
+# enough that bathymetry / shallow-water gradients have room to ramp.
+SDF_RANGE_KM = 8.0
+
+
+def main():
+    if not WATER_MASK_PNG.exists():
+        sys.exit(
+            f"missing {WATER_MASK_PNG}. Run script/gen-water-mask first."
+        )
+
+    t0 = time.time()
+    print(f"Loading {WATER_MASK_PNG.name}")
+    mask = np.asarray(Image.open(WATER_MASK_PNG).convert("L"), dtype=np.uint8)
+    if mask.shape != (WORLD_TEX_SIZE, WORLD_TEX_SIZE):
+        sys.exit(
+            f"unexpected mask shape {mask.shape}, expected "
+            f"({WORLD_TEX_SIZE}, {WORLD_TEX_SIZE})"
+        )
+
+    # 1 = water, 0 = land. Threshold defensively at 128 — the input mask
+    # is technically binary but PNG round-trips can drift a value off if
+    # the file was tampered with.
+    water = mask > 128
+    land = ~water
+
+    # Pixel→km scale. The bbox is square in Web-Mercator metres, and we
+    # cover it with `WORLD_TEX_SIZE` texels per side, so each texel is
+    # `bbox_side_m / WORLD_TEX_SIZE` metres.
+    texel_size_km = (bbox_size_m() / WORLD_TEX_SIZE) / 1000.0
+    print(
+        f"  {water.sum()} water pixels, "
+        f"{land.sum()} land pixels, "
+        f"texel = {texel_size_km:.4f} km"
+    )
+
+    print("Computing distance transforms…")
+    # `distance_transform_edt(arr)` returns "distance from each True
+    # pixel to the nearest False pixel". So:
+    #   * passing `land` (1 on land, 0 on water) gives us, *for every
+    #     land pixel*, the pixel distance to the nearest water pixel.
+    #   * passing `water` gives us, *for every water pixel*, the pixel
+    #     distance to the nearest land pixel.
+    # Pixels not matching the predicate return 0; we mask them out
+    # before combining.
+    t1 = time.time()
+    dist_land_to_water_px = distance_transform_edt(land)
+    print(f"  land→water EDT done ({time.time() - t1:.1f}s)")
+    t1 = time.time()
+    dist_water_to_land_px = distance_transform_edt(water)
+    print(f"  water→land EDT done ({time.time() - t1:.1f}s)")
+
+    # Signed distance in pixels. Sign convention:
+    #   * positive on land (distance to nearest water)
+    #   * negative in water (negated distance to nearest land)
+    sdf_px = np.where(water, -dist_water_to_land_px, dist_land_to_water_px)
+    sdf_km = sdf_px.astype(np.float32) * texel_size_km
+
+    # Quantise into [0, 255]:
+    #   * dist = -SDF_RANGE_KM (deep sea) → 0
+    #   * dist =            0 (coast)     → 127.5
+    #   * dist = +SDF_RANGE_KM (inland)   → 255
+    # Anything outside the band is clamped at the boundary byte.
+    clamped = np.clip(sdf_km, -SDF_RANGE_KM, SDF_RANGE_KM)
+    normalised = (clamped + SDF_RANGE_KM) / (2.0 * SDF_RANGE_KM)
+    byte = np.round(normalised * 255.0).astype(np.uint8)
+
+    # Sanity diagnostics. The interesting metric is "how much of the
+    # texture lives near the coastline?" — that's the precision-critical
+    # band. Anything past ±SDF_RANGE_KM is, by construction, clamped.
+    near_coast = (np.abs(sdf_km) < 1.0).sum()
+    print(
+        f"  range: [{sdf_km.min():.2f}, {sdf_km.max():.2f}] km, "
+        f"{near_coast / sdf_km.size:.1%} within 1 km of coast"
+    )
+
+    Image.fromarray(byte, mode="L").save(WATER_SDF_PNG, optimize=True)
+    print(
+        f"  wrote {WATER_SDF_PNG} "
+        f"({WATER_SDF_PNG.stat().st_size / 1024:.1f} KiB)"
+    )
+    print(f"done in {time.time() - t0:.1f}s")
+
+
+if __name__ == "__main__":
+    main()

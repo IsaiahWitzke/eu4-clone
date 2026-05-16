@@ -52,6 +52,113 @@ struct CameraUniforms {
 @group(0) @binding(5)  var                   atlas_lod3:      texture_2d<f32>;
 @group(0) @binding(6)  var                   samp:            sampler;
 @group(0) @binding(7)  var                   realm_field:     texture_2d<f32>;
+@group(0) @binding(8)  var                   water_sdf:       texture_2d<f32>;
+
+// Water SDF decode — mirrors `WATER_SDF_RANGE_KM` in `tile_bake.wgsl`
+// and `SDF_RANGE_KM` in `script/gen-water-sdf`. The R8 byte maps
+// linearly to the band [-RANGE, +RANGE]: byte=0 = deepest sea, byte=255
+// = deepest inland, byte=128 ≈ the coast.
+const WATER_SDF_RANGE_KM: f32 = 8.0;
+
+fn sample_water_dist_km(uv: vec2<f32>) -> f32 {
+    let byte = textureSampleLevel(water_sdf, samp, uv, 0.0).r;
+    return byte * (2.0 * WATER_SDF_RANGE_KM) - WATER_SDF_RANGE_KM;
+}
+
+// ---- Coastline domain warping ---------------------------------------------
+//
+// The water SDF source is 1.34 km/texel — below that, the coast is
+// piecewise-linear (one straight segment per source texel) and reads
+// as stair-stepping at close zoom. Inigo Quilez’s domain-warping
+// trick (https://iquilezles.org/articles/warp/) hallucinates
+// sub-source detail by perturbing the SDF lookup coordinates with a
+// stack of value-noise octaves. The macro shape stays put; only the
+// exact sub-texel zero-crossing wiggles in a natural-looking way.
+//
+// Three octaves are added together (all amplitudes in km):
+//   smooth     — always on; rounds the source-grid staircase into
+//                gentle bay arcs.
+//   med        — scales linearly with ruggedness; adds peninsular
+//                shape variation everywhere, more in rugged regions.
+//   fine       — scales as ruggedness²; only kicks in on rugged
+//                coasts. Gives the Croatian / fjord fringing.
+//
+// `coast_ruggedness(world_xz)` is itself a slow-varying noise
+// (~25 km wavelength) that says “this region of coast is smooth
+// vs. rugged”; a smoothstep concentrates the distribution toward
+// the extremes so each cohesive stretch gets a clear character.
+//
+// Total amplitude stays under one source texel so the macro shape —
+// which is real geographic data — is preserved.
+
+// ---- Noise primitives (2D value noise) ------------------------------------
+
+// 2D hash → [0, 1]. Standard `fract(sin(dot(...)))` lookalike.
+fn hash2(p_in: vec2<f32>) -> f32 {
+    var p = fract(p_in * vec2<f32>(123.34, 456.21));
+    p = p + dot(p, p + 78.233);
+    return fract(p.x * p.y);
+}
+
+// Value noise with smoothstep interpolation. Output [0, 1].
+fn vnoise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = hash2(i + vec2<f32>(0.0, 0.0));
+    let b = hash2(i + vec2<f32>(1.0, 0.0));
+    let c = hash2(i + vec2<f32>(0.0, 1.0));
+    let d = hash2(i + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// Two decorrelated samples of signed value noise (range [-1, +1] per
+// component). Used to draw a 2D warp displacement from a single base
+// position with one offset for the y component.
+fn vnoise2(p: vec2<f32>, offset_y: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(
+        vnoise(p)            * 2.0 - 1.0,
+        vnoise(p + offset_y) * 2.0 - 1.0,
+    );
+}
+
+// ---- Coastline warp tunables (km) -----------------------------------------
+
+// Wavelength of the region-scale ruggedness field. Larger = bigger
+// stretches of coast share one character.
+const COAST_RUGGEDNESS_WL_KM: f32 = 25.0;
+
+// Per-octave wavelengths and amplitudes (km). `_AMP_MIN`/`_AMP_MAX`
+// brackets bracket the linear ramp from smooth→rugged for the medium
+// octave; the fine octave’s amplitude is scaled by ruggedness² so
+// smooth regions are *clean*, not just less-rough.
+const COAST_WARP_SMOOTH_WL_KM:  f32 = 3.0;
+const COAST_WARP_SMOOTH_AMP_KM: f32 = 0.45;
+const COAST_WARP_MED_WL_KM:     f32 = 0.9;
+const COAST_WARP_MED_AMP_MIN:   f32 = 0.10;
+const COAST_WARP_MED_AMP_MAX:   f32 = 0.30;
+const COAST_WARP_FINE_WL_KM:    f32 = 0.3;
+const COAST_WARP_FINE_AMP_KM:   f32 = 0.18;
+
+// ---- Coastline warp -------------------------------------------------------
+
+fn coast_ruggedness(world_xz: vec2<f32>) -> f32 {
+    return smoothstep(0.30, 0.70, vnoise(world_xz / COAST_RUGGEDNESS_WL_KM));
+}
+
+fn warp_world_xz(world_xz: vec2<f32>) -> vec2<f32> {
+    let rugged = coast_ruggedness(world_xz);
+    let warp_smooth =
+        vnoise2(world_xz / COAST_WARP_SMOOTH_WL_KM, vec2<f32>(7.3, 11.5))
+        * COAST_WARP_SMOOTH_AMP_KM;
+    let warp_med =
+        vnoise2(world_xz / COAST_WARP_MED_WL_KM, vec2<f32>(3.1, 5.7))
+        * mix(COAST_WARP_MED_AMP_MIN, COAST_WARP_MED_AMP_MAX, rugged);
+    let warp_fine =
+        vnoise2(world_xz / COAST_WARP_FINE_WL_KM, vec2<f32>(1.9, 4.1))
+        * COAST_WARP_FINE_AMP_KM * rugged * rugged;
+    return world_xz + warp_smooth + warp_med + warp_fine;
+}
 
 // ---- camera math -----------------------------------------------------------
 // Matches `camera.rs`. FOV = 30°; target Y = 4 km (mid-altitude); near/far
@@ -195,6 +302,13 @@ fn sample_atlas(lod: i32, uv: vec2<f32>) -> vec3<f32> {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let uv = world_to_world_uv(in.world_xz);
 
+    // Warped UV used *only* for the water/coastline lookup — the atlas
+    // still gets sampled at the true position so terrain features
+    // (rivers, mountain ridges, biome boundaries) stay where they
+    // actually are. The warp adds natural sub-source-resolution
+    // wiggle to the coastline, hiding the source grid.
+    let warped_uv = world_to_world_uv(warp_world_xz(in.world_xz));
+
     // LoD selection: pick the coarsest atlas whose km-per-texel is
     // still finer than the on-screen km-per-pixel. Thresholds are at
     // the geometric midpoint between adjacent LoD resolutions, so the
@@ -223,7 +337,29 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(lod_color, 1.0);
     }
 
-    let color = sample_atlas(lod, uv);
+    var color = sample_atlas(lod, uv);
+
+    // ---- Water blend, screen-pixel-accurate ------------------------------
+    //
+    // This used to live in `tile_bake.wgsl`, but the bake outputs at
+    // atlas-texel resolution — so any AA we computed there was locked
+    // to the atlas grid, leaving a visible staircase at close zoom.
+    // Moving the SDF sample here lets us drive the transition by
+    // `fwidth(dist_km)`, which is the screen-pixel-sized derivative.
+    // Result: the land/water seam is always exactly one screen pixel
+    // wide, no matter how zoomed in we are.
+    let dist_km     = sample_water_dist_km(warped_uv);
+    let dist_fwidth = max(fwidth(dist_km), 0.001);
+    let half_band   = dist_fwidth * 0.5;
+    let water_alpha = smoothstep(half_band, -half_band, dist_km);
+
+    // Shallow-shelf gradient. Subtle by design so it doesn’t fight
+    // for visual attention against the coastline itself.
+    let deep_water  = vec3<f32>(0.08, 0.20, 0.40);
+    let shelf_water = vec3<f32>(0.14, 0.28, 0.46);
+    let shelf_inner = smoothstep(-5.0, 0.0, dist_km);
+    let water_color = mix(deep_water, shelf_water, shelf_inner);
+    color = mix(color, water_color, water_alpha);
 
     // TEMPORARY: country/realm tinting disabled while iterating on
     // map look. The realm_field texture binding is still present (the

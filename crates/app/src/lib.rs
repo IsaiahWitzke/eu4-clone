@@ -30,7 +30,10 @@ use crate::ui::CityPanel;
 /// terrain screenshot. When the counter inside `run()` hits zero, the
 /// harness signal `window.__eu4_ready = true` is set so an external
 /// screenshot driver (see `script/screenshot`) can grab the canvas.
-const SCREENSHOT_ASSET_COUNT: u32 = 3;
+///
+/// Bumped from 3 → 4 when the SDF water field landed; we now wait on
+/// heightmap + water_mask + biome_mask + water_sdf before signalling.
+const SCREENSHOT_ASSET_COUNT: u32 = 4;
 
 /// Apply query-string overrides for the initial camera position. Supported
 /// keys (all optional, all floats in world km / radians):
@@ -477,6 +480,15 @@ async fn run() {
         ready_remaining.clone(),
         "./biome_mask.png",
         |r, decoded| r.set_biome_mask(decoded.width, decoded.height, &decoded.bytes),
+    );
+    // Water SDF — the signed distance field that drives smooth water
+    // blending and (eventually) shelf gradients / coastline ink. Built
+    // offline by `script/gen-water-sdf` from `water_mask.png`.
+    spawn_load(
+        renderer.clone(),
+        ready_remaining.clone(),
+        "./water_sdf.png",
+        |r, decoded| r.set_water_sdf(decoded.width, decoded.height, &decoded.bytes),
     );
 
     // cities.json — parsed into a LoadedSettlements (settlements +

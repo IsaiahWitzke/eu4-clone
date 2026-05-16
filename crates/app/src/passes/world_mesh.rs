@@ -36,6 +36,7 @@ pub fn build(
     atlas_views: [&wgpu::TextureView; 4],
     sampler: &wgpu::Sampler,
     realm_field_view: &wgpu::TextureView,
+    water_sdf_view: &wgpu::TextureView,
     target_format: wgpu::TextureFormat,
 ) -> WorldMeshPass {
     let device = &gpu.device;
@@ -124,6 +125,19 @@ pub fn build(
                 },
                 count: None,
             },
+            // 8: water SDF — sampled per fragment for screen-pixel-accurate
+            //    coastline AA + shelf gradient. R8Unorm with the
+            //    encoding documented in `script/gen-water-sdf`.
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     });
 
@@ -183,6 +197,7 @@ pub fn build(
         atlas_views,
         sampler,
         realm_field_view,
+        water_sdf_view,
     );
 
     WorldMeshPass {
@@ -194,7 +209,7 @@ pub fn build(
 
 /// Build a fresh bind group. Called from `build()` and from
 /// `Renderer::rebuild_world_mesh_bind_group` after any input view swaps
-/// (heightmap PNG arriving, atlases rebaking).
+/// (heightmap PNG arriving, atlases rebaking, SDF arriving).
 #[allow(clippy::too_many_arguments)]
 pub fn make_bind_group(
     device: &wgpu::Device,
@@ -204,6 +219,7 @@ pub fn make_bind_group(
     atlas_views: [&wgpu::TextureView; 4],
     sampler: &wgpu::Sampler,
     realm_field_view: &wgpu::TextureView,
+    water_sdf_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("world_mesh bg"),
@@ -240,6 +256,10 @@ pub fn make_bind_group(
             wgpu::BindGroupEntry {
                 binding: 7,
                 resource: wgpu::BindingResource::TextureView(realm_field_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(water_sdf_view),
             },
         ],
     })

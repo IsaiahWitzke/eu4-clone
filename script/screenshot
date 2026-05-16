@@ -50,7 +50,9 @@ while [ $# -gt 0 ]; do
     --url)         URL_OVERRIDE="$2"; shift 2 ;;
     --output)      OUTPUT="$2"; PASS_ARGS+=("--output" "$2"); shift 2 ;;
     --cx|--cz|--dist|--tilt|--width|--height|--timeout)
-                   PASS_ARGS+=("$1" "$2"); shift 2 ;;
+                   # Use `=`-form so Node’s `parseArgs` doesn’t treat a
+                   # negative value (e.g. `--cz -800`) as another flag.
+                   PASS_ARGS+=("$1=$2"); shift 2 ;;
     --keep-open)   PASS_ARGS+=("--keep-open"); shift ;;
     -h|--help)
       sed -n '1,40p' "$0"; exit 0 ;;

@@ -7,9 +7,16 @@
 //
 // Reads:
 //   * world heightmap (Rg8Unorm, 16-bit grayscale packed)
-//   * water mask (R8Unorm)
-//   * biome mask (R8Unorm) — held for future biome tinting; currently unused
+//   * biome mask (R8Unorm)
 //   * BakeUniforms (per-LoD: tiles_per_side)
+//
+// Water blending is NOT done here. The atlas stores *only* terrain
+// colour (biome palette × hillshade). The per-frame world_mesh shader
+// composites water on top at screen-pixel resolution using the SDF —
+// that's the only way to get a one-screen-pixel-wide coastline AA
+// regardless of zoom. Baking a water blend at atlas resolution
+// (8192² at the finest LoD) locks the coastline AA to a 0.67 km grid,
+// which is what produced the visible staircase in earlier iterations.
 //
 // Writes:
 //   * One LoD atlas (RGBA8Unorm).
@@ -27,9 +34,8 @@ struct BakeUniforms {
 }
 @group(0) @binding(0) var<uniform>           bake:           BakeUniforms;
 @group(0) @binding(1) var                    world_heightmap: texture_2d<f32>;
-@group(0) @binding(2) var                    water_mask:      texture_2d<f32>;
-@group(0) @binding(3) var                    biome_mask:      texture_2d<f32>;
-@group(0) @binding(4) var                    samp:            sampler;
+@group(0) @binding(2) var                    biome_mask:      texture_2d<f32>;
+@group(0) @binding(3) var                    samp:            sampler;
 
 struct VsOut {
     @builtin(position) pos:      vec4<f32>,
@@ -92,11 +98,61 @@ fn vs_main(
     return VsOut(vec4<f32>(ndc, 0.0, 1.0), vec2<f32>(world_x, world_z));
 }
 
-// Smooth elevation → base colour. Tuned to look reasonable from sea
-// level (0 m) up to alpine snow (~3500 m).
-fn elevation_color(h_m: f32) -> vec3<f32> {
-    let lowland  = vec3<f32>(0.30, 0.55, 0.25);  // green
-    let highland = vec3<f32>(0.55, 0.45, 0.30);  // brown
+// Per-biome “lowland” palette. Biome IDs come from the WWF / RESOLVE
+// Ecoregions 2017 BIOME_NUM taxonomy (see `script/gen-biome-mask`):
+//   0  ocean / none / outside
+//   4  Temperate Broadleaf       (deep deciduous green)
+//   5  Temperate Conifer         (cooler blue-tinted green)
+//   6  Boreal                    (muted grey-green w/ blue cast)
+//   8  Temperate Grassland       (pale ochre-green steppe)
+//   11 Tundra                    (desaturated grey-mauve)
+//   12 Mediterranean             (dusty olive-tan)
+//   13 Desert                    (warm sand)
+fn biome_lowland(id: u32) -> vec3<f32> {
+    switch id {
+        // 4 Temperate Broadleaf — the baseline green; everything
+        // else reads relative to this.
+        case 4u:  { return vec3<f32>(0.30, 0.46, 0.24); }
+        // 5 Temperate Conifer — slightly cooler, slightly darker.
+        case 5u:  { return vec3<f32>(0.26, 0.42, 0.26); }
+        // 6 Boreal — desaturated mossy green with a cold cast.
+        case 6u:  { return vec3<f32>(0.34, 0.44, 0.34); }
+        // 8 Temperate Grassland — dry steppe khaki. Pulled toward
+        // green from straight ochre so the boundary with broadleaf
+        // is less of a stamp.
+        case 8u:  { return vec3<f32>(0.48, 0.52, 0.30); }
+        // 11 Tundra — cool desaturated grey-green. Was warm/orange
+        // in iter1; the warm “tundra” feel was actually the highland
+        // brown bleeding through Norway.
+        case 11u: { return vec3<f32>(0.42, 0.46, 0.42); }
+        // 12 Mediterranean — dusty olive. Iter1 was too
+        // golden/saturated and stamped on hard against neighbours.
+        case 12u: { return vec3<f32>(0.48, 0.48, 0.30); }
+        // 13 Desert — warm sand, slightly desaturated.
+        case 13u: { return vec3<f32>(0.72, 0.62, 0.42); }
+        // Ocean / no-coverage fallback. Real ocean fragments get
+        // overwritten by the water blend anyway; this colour shows up
+        // only for land tiles outside the Ecoregions polygon
+        // coverage (Iceland edge cases, etc).
+        default:  { return vec3<f32>(0.32, 0.46, 0.26); }
+    }
+}
+
+// Mountain-rock colour per biome. The shared “warm sandstone” brown
+// from iter1 made Scandinavian uplands look Mediterranean. Cold
+// biomes get a grey-slate highland; warm biomes get the
+// dry-sandstone highland; everything else lands in between.
+fn biome_highland(id: u32) -> vec3<f32> {
+    switch id {
+        case 6u, 11u:        { return vec3<f32>(0.42, 0.42, 0.42); }  // cold grey
+        case 12u, 13u:       { return vec3<f32>(0.58, 0.48, 0.34); }  // warm sandstone
+        default:             { return vec3<f32>(0.48, 0.44, 0.36); }  // neutral
+    }
+}
+
+fn terrain_color(h_m: f32, biome_id: u32) -> vec3<f32> {
+    let lowland  = biome_lowland(biome_id);
+    let highland = biome_highland(biome_id);
     let snow     = vec3<f32>(0.95, 0.95, 0.95);
     let t = clamp(h_m / 3000.0, 0.0, 1.0);
     var c = mix(lowland, highland, smoothstep(0.0, 0.6, t));
@@ -127,19 +183,42 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let lambert = max(dot(normal, sun), 0.0);
     let light   = 0.45 + 0.55 * lambert;
 
-    var color = elevation_color(hc) * light;
-
-    // Water blend. The mask is soft-edged (8-bit greyscale), so we
-    // ramp through it for a clean shoreline.
+    // Biome IDs are categorical, so we *can’t* bilinear-filter them.
+    // But we can blend the resulting *colours* from a couple of
+    // nearby taps to soften the worst stamped-edge artefacts where
+    // two biomes meet. 5-tap (centre + 4 cardinal neighbours one
+    // texel away) is a cheap compromise.
     let uv = world_to_world_uv(xz);
-    let water = textureSampleLevel(water_mask, samp, uv, 0.0).r;
-    let water_color = vec3<f32>(0.12, 0.28, 0.48);
-    color = mix(color, water_color, smoothstep(0.30, 0.70, water));
+    let dims_i = vec2<i32>(textureDimensions(biome_mask));
+    let dims_f = vec2<f32>(dims_i);
+    let center_px = clamp(
+        vec2<i32>(uv * dims_f),
+        vec2<i32>(0),
+        dims_i - vec2<i32>(1),
+    );
+    var color_sum = vec3<f32>(0.0);
+    var weight_sum = 0.0;
+    // Centre tap is weighted heavier so the dominant biome wins; the
+    // neighbours only smooth the seam.
+    let offs = array<vec2<i32>, 5>(
+        vec2<i32>( 0,  0),
+        vec2<i32>( 1,  0),
+        vec2<i32>(-1,  0),
+        vec2<i32>( 0,  1),
+        vec2<i32>( 0, -1),
+    );
+    let weights = array<f32, 5>(2.0, 1.0, 1.0, 1.0, 1.0);
+    for (var i = 0u; i < 5u; i = i + 1u) {
+        let p = clamp(center_px + offs[i], vec2<i32>(0), dims_i - vec2<i32>(1));
+        let id = u32(round(textureLoad(biome_mask, p, 0).r * 255.0));
+        color_sum  = color_sum + terrain_color(hc, id) * weights[i];
+        weight_sum = weight_sum + weights[i];
+    }
+    let color = (color_sum / weight_sum) * light;
 
-    // biome_mask is held but unused for now to keep the bake simple;
-    // sampling it suppresses the "binding unused" validation warning
-    // and lets us layer biome tints in without changing the bind group.
-    let _biome_id = textureSampleLevel(biome_mask, samp, uv, 0.0).r;
+    // No water blend here — see the file header. The atlas stores
+    // *only* terrain colour; `world_mesh.wgsl` composites water on
+    // top per-frame using the SDF for screen-pixel-accurate AA.
 
     return vec4<f32>(color, 1.0);
 }

@@ -30,7 +30,7 @@ cp web/index.html dist/index.html
 #    directly by the local server / GitHub Pages and fetched by the wasm at
 #    startup, so the wasm bundle itself stays small. Listed explicitly so that
 #    incidental files in assets/ (e.g. the local-only preview.png) don't ship.
-for asset in heightmap.png water_mask.png biome_mask.png cities.json glyph_atlas.png glyph_atlas.json; do
+for asset in heightmap.png water_mask.png water_sdf.png biome_mask.png cities.json glyph_atlas.png glyph_atlas.json; do
   src="$ROOT/crates/app/assets/$asset"
   if [ -f "$src" ]; then
     cp "$src" "$ROOT/dist/$asset"

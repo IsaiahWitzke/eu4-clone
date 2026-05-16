@@ -56,7 +56,6 @@ pub struct TileBakePass {
 pub fn build(
     gpu: &GpuContext,
     world_heightmap_view: &wgpu::TextureView,
-    water_mask_view: &wgpu::TextureView,
     biome_mask_view: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
 ) -> TileBakePass {
@@ -87,7 +86,7 @@ pub fn build(
                 },
                 count: None,
             },
-            // 2: water_mask
+            // 2: biome_mask
             wgpu::BindGroupLayoutEntry {
                 binding: 2,
                 visibility: wgpu::ShaderStages::FRAGMENT,
@@ -98,20 +97,9 @@ pub fn build(
                 },
                 count: None,
             },
-            // 3: biome_mask
+            // 3: sampler
             wgpu::BindGroupLayoutEntry {
                 binding: 3,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            // 4: sampler
-            wgpu::BindGroupLayoutEntry {
-                binding: 4,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
@@ -214,14 +202,10 @@ pub fn build(
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(water_mask_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
                     resource: wgpu::BindingResource::TextureView(biome_mask_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 4,
+                    binding: 3,
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],
@@ -247,7 +231,6 @@ impl TileBakePass {
         &mut self,
         device: &wgpu::Device,
         world_heightmap_view: &wgpu::TextureView,
-        water_mask_view: &wgpu::TextureView,
         biome_mask_view: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
     ) {
@@ -266,14 +249,10 @@ impl TileBakePass {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::TextureView(water_mask_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
                         resource: wgpu::BindingResource::TextureView(biome_mask_view),
                     },
                     wgpu::BindGroupEntry {
-                        binding: 4,
+                        binding: 3,
                         resource: wgpu::BindingResource::Sampler(sampler),
                     },
                 ],
