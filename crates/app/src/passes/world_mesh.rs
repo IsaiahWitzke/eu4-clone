@@ -134,11 +134,12 @@ pub fn build(
                 count: None,
             },
             // 8: water SDF — sampled per fragment for screen-pixel-accurate
-            //    coastline AA + shelf gradient. R8Unorm with the
-            //    encoding documented in `script/gen-water-sdf`.
+            //    coastline AA + shelf gradient, and per vertex for the
+            //    coastal-lift displacement. R8Unorm with the encoding
+            //    documented in `script/gen-water-sdf`.
             wgpu::BindGroupLayoutEntry {
                 binding: 8,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Texture {
                     sample_type: wgpu::TextureSampleType::Float { filterable: true },
                     view_dimension: wgpu::TextureViewDimension::D2,

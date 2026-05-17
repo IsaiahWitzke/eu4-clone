@@ -551,6 +551,25 @@ fn quad_corner(corner: u32) -> vec2<u32> {
     return quad[corner];
 }
 
+// Coastal-lift falloff. Raises land vertices near the coast so coasts
+// visibly "pop" out of the water at tilted views. Safe to apply now
+// that the water plane is structurally separate from this mesh
+// (the lift cannot drag rendered water up — water always sits at y=0).
+const COAST_LIFT_KM:       f32 = 0.30;
+const COAST_LIFT_DECAY_KM: f32 = 2.5;
+
+fn coastal_lift_km(world_xz: vec2<f32>) -> f32 {
+    let dist_km = sample_water_dist_km(world_to_world_uv(world_xz));
+    if (dist_km <= 0.0) {
+        return 0.0;
+    }
+    // Exponential falloff: max at the coast, ~37% at one decay, ~5%
+    // at three decays, negligible past four. Narrow enough to read
+    // as a coastal cliff/beach rise rather than a hill.
+    let falloff = exp(-dist_km / COAST_LIFT_DECAY_KM);
+    return COAST_LIFT_KM * falloff;
+}
+
 @vertex
 fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
     let cells_per_side = MESH_GRID - 1u;
@@ -568,14 +587,15 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
     let world_size_km = 2.0 * WORLD_HALF_KM;
     let world_x =  -WORLD_HALF_KM + fx * world_size_km;
     let world_z =   WORLD_HALF_KM - fy * world_size_km;
+    let world_xz = vec2<f32>(world_x, world_z);
 
-    // Heightmap-displaced world Y. The PNG uses the same UV convention
-    // (row 0 = north), so we feed it (fx, fy) directly.
+    // Heightmap-displaced world Y, plus per-vertex coastal lift so
+    // coastlines pop up visibly above the water plane.
     let uv      = vec2<f32>(fx, fy);
-    let world_y = sample_height_km(uv);
+    let world_y = sample_height_km(uv) + coastal_lift_km(world_xz);
 
     let clip = project(vec3<f32>(world_x, world_y, world_z));
-    return VsOut(clip, vec2<f32>(world_x, world_z));
+    return VsOut(clip, world_xz);
 }
 
 // Water plane vertex shader. Six verts forming two triangles — a single
@@ -827,13 +847,22 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Same gates as before; see the original land/water-combined shader
     // for the full rationale. Sand mixed into the land colour wherever
     // the gates align.
-    let BEACH_BAND_KM: f32 = 0.6;
+    //
+    // Iter 3 tuning:
+    //   * BEACH_BAND_KM widened to 2.0 km — sandy strip now reads
+    //     clearly at regional zoom (~600 km camera distance), not
+    //     just at close zoom.
+    //   * beach_seed thresholds lowered so most non-cliff coasts get
+    //     beaches by default; only explicitly-rocky stretches stay clean.
+    //   * beach_zoom_fade widened so beaches stay visible across
+    //     more zoom levels (down to ~1.5 km/px).
+    let BEACH_BAND_KM: f32 = 2.0;
     let land_dist_km = max(0.0, dist_km);
     let beach_proximity = smoothstep(BEACH_BAND_KM, 0.0, land_dist_km);
 
     let beach_run_lo = vnoise(coast_point / 12.0);
     let beach_run_hi = vnoise(coast_point / 1.5 + vec2<f32>(17.1, 23.3));
-    let beach_seed = smoothstep(0.40, 0.70,
+    let beach_seed = smoothstep(0.20, 0.55,
         beach_run_lo * 0.6 + beach_run_hi * 0.4);
 
     let slope_eps_km = 0.5;
@@ -845,7 +874,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         length(vec2<f32>(h_xp - h_xm, h_zp - h_zm)) / (2.0 * slope_eps_km);
     let flat_gate = 1.0 - smoothstep(0.06, 0.20, beach_slope);
 
-    let beach_zoom_fade = smoothstep(0.80, 0.20, pixel_world_km);
+    let beach_zoom_fade = smoothstep(1.50, 0.30, pixel_world_km);
 
     let beach =
         beach_proximity * beach_seed * flat_gate * big_coast * beach_zoom_fade;
@@ -899,8 +928,14 @@ fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
     let shallow_c = vec3<f32>(0.42, 0.72, 0.70);
     let mid_c     = vec3<f32>(0.24, 0.46, 0.58);
     let deep_c    = vec3<f32>(0.06, 0.16, 0.34);
-    let t_low  = smoothstep(0.0, 5.0, offshore_km_for_color);
-    let t_high = smoothstep(200.0, 2500.0, bathy_m);
+    // shallow → mid: SDF-driven, widened to 0–15 km so narrow straits
+    // and archipelagos (Aegean, Channel, etc.) stay in the aqua band
+    // all the way across with only a hint of deepening in the middle.
+    let t_low  = smoothstep(0.0, 15.0, offshore_km_for_color);
+    // mid → deep: bathymetry-driven, pushed deeper. Continental
+    // shelves (200–1000 m) now stay teal; only true abyssal depth
+    // (>3500 m) hits the deepest blue.
+    let t_high = smoothstep(800.0, 3500.0, bathy_m);
     var depth_color = shallow_c;
     depth_color = mix(depth_color, mid_c,  t_low);
     depth_color = mix(depth_color, deep_c, t_high);
