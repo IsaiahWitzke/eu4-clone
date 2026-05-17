@@ -23,7 +23,14 @@ pub fn mesh_vertex_count() -> u32 {
 }
 
 pub struct WorldMeshPass {
-    pipeline: wgpu::RenderPipeline,
+    /// Water plane pass: flat quad at y=0 covering the world disc.
+    /// Renders first so the land pass can alpha-blend on top.
+    water_pipeline: wgpu::RenderPipeline,
+    /// Land mesh pass: heightmap-displaced MESH_GRID² grid. Renders
+    /// second with SrcAlpha/OneMinusSrcAlpha blending so the shoreline
+    /// alpha falloff produces screen-pixel-wide coast AA over the
+    /// water plane.
+    land_pipeline: wgpu::RenderPipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub bind_group: wgpu::BindGroup,
 }
@@ -166,8 +173,49 @@ pub fn build(
         immediate_size: 0,
     });
 
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("world_mesh pipeline"),
+    // Water plane pipeline. No blending (water is the base layer);
+    // depth_write=true so the land pass's depth_test=Less rejects
+    // fully-water fragments cleanly.
+    let water_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("world_mesh water pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_water"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_water"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: MESH_DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // Land mesh pipeline. Alpha blending so the fragment shader's
+    // shoreline alpha output produces screen-pixel-wide coast AA against
+    // whatever the water pass wrote underneath.
+    let land_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("world_mesh land pipeline"),
         layout: Some(&pipeline_layout),
         vertex: wgpu::VertexState {
             module: &module,
@@ -181,7 +229,17 @@ pub fn build(
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: target_format,
-                blend: None,
+                blend: Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::SrcAlpha,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    // Alpha channel just gets replaced — nothing
+                    // downstream actually reads framebuffer alpha,
+                    // so the simple OVER blend is fine.
+                    alpha: wgpu::BlendComponent::OVER,
+                }),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -193,8 +251,23 @@ pub fn build(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: MESH_DEPTH_FORMAT,
-            depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::Less),
+            // Land mesh does NOT write depth. The water plane already
+            // owns the depth at y=0 across the world.
+            depth_write_enabled: Some(false),
+            // Always pass the depth test. The only gate on whether a
+            // land fragment draws is the SDF discard in fs_main.
+            //
+            // Why not Less / LessEqual: coastal-cliff mesh triangles
+            // have one vertex at water level (y=0, heightmap returns
+            // 0 for sea) and another inland (y>0). Within such a
+            // triangle, the rasterizer interpolates Y across all its
+            // fragments. With Less, fragments whose interpolated Y
+            // happens to equal the water-plane depth fail the test;
+            // adjacent fragments with Y slightly above pass. That
+            // produces a torn striped pattern at world zoom where
+            // the triangles are only a few pixels across. Always
+            // depth-test sidesteps the whole interaction.
+            depth_compare: Some(wgpu::CompareFunction::Always),
             stencil: Default::default(),
             bias: Default::default(),
         }),
@@ -216,7 +289,8 @@ pub fn build(
     );
 
     WorldMeshPass {
-        pipeline,
+        water_pipeline,
+        land_pipeline,
         bind_group_layout: bgl,
         bind_group,
     }
@@ -323,8 +397,14 @@ impl WorldMeshPass {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        rpass.set_pipeline(&self.pipeline);
         rpass.set_bind_group(0, &self.bind_group, &[]);
+
+        // Water first: flat 6-vert quad at y=0.
+        rpass.set_pipeline(&self.water_pipeline);
+        rpass.draw(0..6, 0..1);
+
+        // Land second: heightmap-displaced grid, alpha-blended over water.
+        rpass.set_pipeline(&self.land_pipeline);
         rpass.draw(0..mesh_vertex_count(), 0..1);
     }
 }

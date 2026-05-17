@@ -520,7 +520,19 @@ fn realm_palette(id: u32) -> vec3<f32> {
     return vec3<f32>(0.85) - clamp(c - 1.0, vec3<f32>(0.0), vec3<f32>(1.0)) * 0.5;
 }
 
-// ---- vertex shader: 6 verts per cell, MESH_GRID² grid -----------------------
+// ---- vertex shaders --------------------------------------------------------
+//
+// Two entry points, two pipelines:
+//
+//   * `vs_water` — a 6-vert (2-triangle) flat quad covering the world disc
+//     at y=0. The water pass uses this. The water surface is structurally
+//     decoupled from the heightmap so coastal-cliff mesh triangles can't
+//     drag the rendered water up into the air anymore.
+//
+//   * `vs_main` — the heightmap-displaced land mesh (`MESH_GRID²` grid,
+//     6 verts per cell). The land pass uses this. Same vertex math as
+//     before; only the fragment side changed (now outputs alpha for
+//     screen-pixel-accurate coast AA against the water plane underneath).
 
 struct VsOut {
     @builtin(position) clip:     vec4<f32>,
@@ -563,6 +575,28 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
     let world_y = sample_height_km(uv);
 
     let clip = project(vec3<f32>(world_x, world_y, world_z));
+    return VsOut(clip, vec2<f32>(world_x, world_z));
+}
+
+// Water plane vertex shader. Six verts forming two triangles — a single
+// quad covering the whole world disc in XZ at y=0. Frags interpolate
+// world_xz so the fragment shader can compute waves / depth color /
+// foam exactly as before, just without inheriting any height from the
+// heightmap.
+@vertex
+fn vs_water(@builtin(vertex_index) vid: u32) -> VsOut {
+    var quad = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 1.0, -1.0),
+        vec2<f32>( 1.0,  1.0),
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 1.0,  1.0),
+        vec2<f32>(-1.0,  1.0),
+    );
+    let xy = quad[vid] * WORLD_HALF_KM;
+    let world_x = xy.x;
+    let world_z = xy.y;
+    let clip = project(vec3<f32>(world_x, 0.0, world_z));
     return VsOut(clip, vec2<f32>(world_x, world_z));
 }
 
@@ -702,31 +736,34 @@ fn terrain_color_proc(world_xz: vec2<f32>, pixel_world_km: f32) -> vec3<f32> {
     return c;
 }
 
+// ---- Fragment shaders ------------------------------------------------------
+//
+// fs_main = LAND. Procedural ground + beaches + shoreline alpha.
+// fs_water = WATER. TDM seascape + depth ramp + foam.
+//
+// Both share the SDF + helper functions above. The land pass renders
+// on top of the water pass with alpha blending so the coast AA happens
+// via the shoreline alpha falloff rather than an inline land/water mix.
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let uv = world_to_world_uv(in.world_xz);
 
-    // Warped UV used *only* for the water/coastline lookup — the atlas
-    // still gets sampled at the true position so terrain features
-    // (rivers, mountain ridges, biome boundaries) stay where they
-    // actually are. The warp adds natural sub-source-resolution
-    // wiggle to the coastline, hiding the source grid.
+    // Warped UV for the SDF lookup — same sub-source coastline wiggle
+    // the water pass uses, so the visible coast lines up.
     let warped_uv = world_to_world_uv(warp_world_xz(in.world_xz));
 
-    // LoD selection: pick the coarsest atlas whose km-per-texel is
-    // still finer than the on-screen km-per-pixel. Thresholds are at
-    // the geometric midpoint between adjacent LoD resolutions, so the
-    // switch happens at the zoom level where atlas and screen sampling
-    // density are matched.
+    // LoD selection (kept for the debug overlay; the procedural ground
+    // doesn't actually consume `lod` since the atlas is no longer the
+    // source of ground colour).
     let pixel_world_km = max(fwidth(in.world_xz.x), fwidth(in.world_xz.y));
     var lod: i32 = 0;
     if (pixel_world_km < sqrt(LOD_KM_PER_TEXEL_0 * LOD_KM_PER_TEXEL_1)) { lod = 1; }
     if (pixel_world_km < sqrt(LOD_KM_PER_TEXEL_1 * LOD_KM_PER_TEXEL_2)) { lod = 2; }
     if (pixel_world_km < sqrt(LOD_KM_PER_TEXEL_2 * LOD_KM_PER_TEXEL_3)) { lod = 3; }
 
-    // M-key debug overlay: replace the world colour with a per-LoD
-    // tint so you can see which atlas is being sampled at each
-    // fragment. Cycle: Terrain (0) → Political (1) → DebugLod (2) → ...
+    // M-key debug overlay: per-LoD tint over the land mesh. Water still
+    // renders normally underneath.
     if (camera.map_mode == 2u) {
         var lod_color = vec3<f32>(0.0);
         if (lod == 0) {
@@ -741,362 +778,55 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(lod_color, 1.0);
     }
 
-    // Procedural ground colour, replacing the baked atlas sample.
-    // The atlas binding is kept (the bind-group layout still requires
-    // it) but it's no longer the source of ground colour.
+    // Coast distance. CRITICAL: we use the UNWARPED uv here. The warp
+    // adds up to ~1 km of UV displacement, which at close zoom is a
+    // sub-source-texel wiggle (nice for the visible coast). At world
+    // zoom one screen pixel covers several km, and that 1 km warp can
+    // shift land fragments to sample water (rivers, lakes, narrow
+    // inland features that the SDF records as local minima). Without
+    // this fix, large swathes of inland land discard incorrectly at
+    // world zoom and you see the water plane through them.
+    //
+    // Discard policy: HARD discard at the SDF zero-crossing. Any soft
+    // alpha-blended AA band ends up tangling with the coastal-cliff
+    // mesh triangles at zoomed-out views, so we accept slightly
+    // aliased coasts at extreme close zoom in exchange for clean
+    // rendering everywhere else.
+    let dist_km = sample_water_dist_km(uv);
+    if (dist_km < 0.0) {
+        discard;
+    }
+
+    // Procedural ground colour. The atlas binding is kept (bind-group
+    // layout still references it) but no longer the source of colour.
     var color = terrain_color_proc(in.world_xz, pixel_world_km) * terrain_light(in.world_xz);
 
-    // ---- Water blend, screen-pixel-accurate ------------------------------
+    // ---- Coast geometry for beach band ---------------------------------
     //
-    // This used to live in `tile_bake.wgsl`, but the bake outputs at
-    // atlas-texel resolution — so any AA we computed there was locked
-    // to the atlas grid, leaving a visible staircase at close zoom.
-    // Moving the SDF sample here lets us drive the transition by
-    // `fwidth(dist_km)`, which is the screen-pixel-sized derivative.
-    // Result: the land/water seam is always exactly one screen pixel
-    // wide, no matter how zoomed in we are.
-    let dist_km     = sample_water_dist_km(warped_uv);
-    let dist_fwidth = max(fwidth(dist_km), 0.001);
-    let half_band   = dist_fwidth * 0.5;
-    let water_alpha = smoothstep(half_band, -half_band, dist_km);
-
-    // ---- TDM Seascape shading -------------------------------------------
-    //
-    // Compute the wave heightfield + normal once and feed both into
-    // TDM's color formula:
-    //
-    //     color = mix(refracted, reflected, fresnel)
-    //           + SEA_WATER_COLOR · (h - SEA_HEIGHT) · 0.18    // height mod
-    //           + specular(...)                                   // sun glint
-    //
-    // The height-mod term is the single most important visual
-    // element: it brightens crests and darkens troughs directly
-    // from `h`, bypassing the normal/light geometry. This is what
-    // makes a flat-mesh top-down water surface read as actually
-    // having waves — instead of just a faintly-tilted blue plane.
-    //
-    // Coastal damping: scale wave intensity by distance-from-shore so
-    // the water reads as calm in the immediate near-shore band (open
-    // ocean still gets full waves). 0 at the coast itself, full at
-    // 6 km offshore — chosen so a small bay reads as glassy while the
-    // North Sea still gets full chop.
-    //
-    // Important: `coast_calm` is applied to `wave_h` (the height
-    // value that drives the brighten-the-crests color tint), but NOT
-    // to the normal-strength passed into `wave_normal` or to the
-    // specular highlight. Reason: a fully-flat normal collapses both
-    // the fresnel sky-reflection and the sun-glint specular to ~0,
-    // which produces a visible "no-glint halo" within the coast_calm
-    // band. By keeping the normal full-strength near the coast, the
-    // sun reflection extends all the way to the shore; only the
-    // color-tint variation (the visible "chop") is calmed.
-    let coast_calm = smoothstep(-1.0, -6.0, dist_km);
-    let wave_str = wave_strength(pixel_world_km);
-    let wave_h_raw = wave_height(in.world_xz, pixel_world_km);
-    let wave_h   = wave_h_raw * coast_calm;
-    let normal   = wave_normal(in.world_xz, pixel_world_km, wave_str);
-
-    // View direction (fragment → eye). Water plane lives at y = 0;
-    // wave amplitudes (< 2 km peak) are negligible against camera
-    // distance (hundreds of km) for the purpose of this dir.
-    let cb_water = cam_basis();
-    let frag_pos = vec3<f32>(in.world_xz.x, 0.0, in.world_xz.y);
-    let view_dir = normalize(cb_water.eye - frag_pos);
-    let sun      = normalize(WATER_SUN_DIR);
-
-    // TDM Fresnel: cubic, capped at 0.5 so even at grazing the
-    // water isn't a pure sky mirror. Note the cap is essential —
-    // without it, low-tilt views render as featureless reflected sky.
-    let fresnel_raw = clamp(1.0 - dot(normal, view_dir), 0.0, 1.0);
-    let fresnel     = min(fresnel_raw * fresnel_raw * fresnel_raw, 0.5);
-
-    // Sky reflection sampled by the bounced view ray.
-    let reflected = sky_color(reflect(-view_dir, normal));
-
-    // "Refracted" body color: dark base + diffuse-shaded saturated
-    // water tint. The diffuse term scales the SEA_WATER_COLOR
-    // contribution by surface orientation w.r.t. the sun.
-    let refracted = SEA_BASE_COLOR
-                    + water_diffuse(normal, sun, 80.0) * SEA_WATER_COLOR * 0.12;
-
-    var water_color = mix(refracted, reflected, fresnel);
-
-    // Height-modulated brightening / darkening of crests and troughs.
-    // Coefficient bumped from TDM's 0.18 to 0.40 because our top-down
-    // view doesn't get the Fresnel-driven crest brightening TDM's
-    // oblique view does — we need the height-mod term itself to
-    // carry more of the visual weight. `wave_str` fades it out at
-    // coarse zooms (matches the normal fade) so faraway water
-    // doesn't show wave detail.
-    water_color = water_color
-                  + SEA_WATER_COLOR * (wave_h - SEA_HEIGHT_KM) * 0.04 * wave_str;
-
-    // Sun glint specular. Shininess 40 — TDM uses a distance-aware
-    // 600/sqrt(dist²). We use a fixed mid-range exponent that's
-    // wider than TDM's typical 60 so glint reads as a few-pixel
-    // streak instead of a single pinpoint.
-    // Specular: shininess 50 (slightly broader lobe) and scaled by
-    // 0.25 so the glint reads as a soft brightening rather than
-    // sharp sparkles. Reference CK3 water has a *gradient* glint,
-    // not a sparkly chrome look.
-    let spec = water_specular_tdm(normal, sun, view_dir, 50.0) * wave_str * 0.25;
-    water_color = water_color + vec3<f32>(spec);
-
-    // ---- Depth-driven color ramp ---------------------------------------
-    //
-    // Two complementary depth signals drive a 3-stop palette ramp:
-    //   * SDF distance-from-shore (`offshore_km_for_color`, 0..8 km)
-    //     — tight, geometry-driven, perfect for the narrow aqua band
-    //     hugging the coast where the eye expects shallows.
-    //   * Real bathymetry in metres (`bathy_m`, 0..6000 m) — sourced
-    //     from Mapzen terrarium tiles via `script/gen-bathymetry`.
-    //     Drives the long offshore fade: the North Sea / Adriatic /
-    //     Baltic stay teal because they're genuinely shallow; the
-    //     deep Atlantic and Med trenches go properly dark because
-    //     they're genuinely deep. This is what the SDF alone cannot
-    //     do — it saturates at 8 km offshore.
-    //
-    // Sampling at `uv` (not `warped_uv`): the warp exists to wiggle
-    // the SDF zero-crossing for sub-source coastline detail, but
-    // bathymetry varies on tens-of-km scales — sub-km perturbation
-    // adds noise without buying anything.
-    let offshore_km_for_color = max(0.0, -dist_km);
-    let bathy_m = sample_bathymetry_m(uv);
-
-    let shallow_c = vec3<f32>(0.42, 0.72, 0.70); // muted aqua
-    let mid_c     = vec3<f32>(0.24, 0.46, 0.58); // shelf teal
-    let deep_c    = vec3<f32>(0.06, 0.16, 0.34); // deep ocean blue
-
-    // shallow → mid: SDF-driven so the aqua band is a tight ~5 km
-    // ring at every coast regardless of how deep the offshore water
-    // actually is. Without this, places where the shelf drops off
-    // sharply at the coastline (Norwegian fjords, etc.) would skip
-    // the aqua zone entirely and read as deep navy right against
-    // the shore — visually wrong even if technically accurate.
-    let t_low  = smoothstep(0.0, 5.0, offshore_km_for_color);
-
-    // mid → deep: bathymetry-driven over [200 m, 2500 m]. 200 m is
-    // the continental shelf edge — below that water is still
-    // shallow-feeling. By 2500 m we're in the abyssal plain and
-    // the color should be at its deepest.
-    let t_high = smoothstep(200.0, 2500.0, bathy_m);
-
-    var depth_color = shallow_c;
-    depth_color = mix(depth_color, mid_c,  t_low);
-    depth_color = mix(depth_color, deep_c, t_high);
-    water_color = mix(water_color, depth_color, 0.75);
-
-    // Soft surf tint. Was a near-white paint colour (0.88, 0.94, 0.96)
-    // which made the foam read as a separate decal layer instead of
-    // part of the water shading. Now matches SEA_WATER_COLOR almost
-    // exactly so the surf brightening looks like an extension of
-    // the existing wave-crest tint, just stronger near the coast.
-    let foam_color = vec3<f32>(0.78, 0.86, 0.90);
-
-    // ---- Coast foam: anchored emission + propagating wave fronts ------
-    //
-    // Replaces the old two-band approach (which sampled a panning
-    // noise field, making foam visibly slide along the shore as if
-    // the emission points themselves were moving).
-    //
-    // New model:
-    //   1. Each water fragment projects to its nearest coast point
-    //      along the SDF gradient:
-    //          coast_point ≈ P + (-dist_km) * coast_normal
-    //      (coast_normal points inland because the SDF gradient
-    //      points from low to high values.)
-    //   2. A *static* emission-strength noise is sampled at
-    //      coast_point. This is world-anchored — a given spot on
-    //      the coast always emits the same amount of foam, the
-    //      pattern does not pan with time.
-    //   3. Foam currently visible at offshore distance d was emitted
-    //      at the coast at time (t - d/v). So the phase at a
-    //      fragment is `((t - d/v) / T) mod 1`. Lines of constant
-    //      phase satisfy `d = v*t + const` — i.e. they sweep
-    //      offshore at speed v. That's what makes the rings
-    //      visibly propagate.
-    //   4. To show multiple wave fronts simultaneously, we sum N
-    //      phase-offset copies of a pulse function. Bump
-    //      FOAM_LAYERS to add more visible rings.
-    //   5. A dissipation envelope fades foam to zero by
-    //      FOAM_MAX_DIST_KM offshore.
-    //
-    // The SDF gradient + laplacian are still useful for the curvature
-    // modulator (foam gets a global boost on curved coast sections)
-    // and for the projection onto the coast.
-
-    // ---- SDF derivatives. `eps_km = 2.0` spans ≈ 1.5 SDF source
-    // texels — enough to be dominated by real coastline curvature,
-    // not source-grid noise.
+    // The beach band gates need the same SDF gradient / coast_point /
+    // big_coast probe that the water pass's foam uses. Duplicated here
+    // rather than passed via varyings because the two passes can't
+    // share fragment data.
     let eps_km = 2.0;
     let d_xp = sample_water_dist_km(world_to_world_uv(in.world_xz + vec2<f32>( eps_km, 0.0)));
     let d_xm = sample_water_dist_km(world_to_world_uv(in.world_xz + vec2<f32>(-eps_km, 0.0)));
     let d_zp = sample_water_dist_km(world_to_world_uv(in.world_xz + vec2<f32>(0.0,  eps_km)));
     let d_zm = sample_water_dist_km(world_to_world_uv(in.world_xz + vec2<f32>(0.0, -eps_km)));
-    let laplacian = (d_xp + d_xm + d_zp + d_zm - 4.0 * dist_km) / (eps_km * eps_km);
-
-    // SDF gradient — points inland in the water band.
     let grad_x = (d_xp - d_xm) / (2.0 * eps_km);
     let grad_z = (d_zp - d_zm) / (2.0 * eps_km);
     let grad_len = max(length(vec2<f32>(grad_x, grad_z)), 1e-6);
     let coast_normal = vec2<f32>(grad_x, grad_z) / grad_len;
-
-    // Global curvature multiplier (both coves and headlands get foam,
-    // straight coasts get a baseline). Multiplied by ruggedness so
-    // smooth regions stay cleaner.
-    let curvature = clamp(abs(laplacian) * 5.0, 0.0, 1.0);
-    let foam_modulator =
-        (0.30 + 0.70 * curvature) * (0.5 + 0.5 * coast_ruggedness(in.world_xz));
-
-    // ---- Foam tunables ----------------------------------------------
-    // The cycle WAVELENGTH (v * T) must be significantly larger than
-    // the band depth (inner + outer), otherwise the band shows both a
-    // bright peak and the dark trough of the cosine pulse at the
-    // same time — visible as thin parallel "lines between waves"
-    // tracing the SDF iso-contours. With v*T = 5.0 km and band
-    // depth = 2.0 km, only ~40% of a cycle is visible across the
-    // band at any instant, so the whole band brightens/dims as a
-    // single unit instead.
-    let FOAM_PERIOD_S       = 50.0;
-    let FOAM_SPEED_KM_PER_S = 0.25;
-    let FOAM_PEAK_OFFSHORE_KM = 3.50;
-    let FOAM_BAND_INNER_KM    = 0.80;
-    let FOAM_BAND_OUTER_KM    = 1.20;
-    let FOAM_EMISSION_WL_KM   = 4.0;
-    // Duty cycle: foam is bright for this fraction of the cycle,
-    // dark for the rest. 0.10 means each wave is visible for ~5 s
-    // of every 50 s period — same wave width, much less frequent.
-    let FOAM_PULSE_DUTY: f32 = 0.10;
-    // How far offshore (from the projected coast point) to probe the
-    // SDF for the "big-coast" test. Set well beyond the outer edge
-    // of the foam band — if the probe is still in deep water there,
-    // this fragment is on a real ocean coast.
-    let FOAM_COAST_SIZE_PROBE_KM: f32 = 6.0;
-
-    // 1. Project to nearest coast point. Approximation: in the
-    //    water band the SDF gradient has length ≈1, so walking from P
-    //    by (-dist_km) along coast_normal lands at the zero-set.
     let coast_point = in.world_xz + (-dist_km) * coast_normal;
-
-    // 1b. Big-coast gate. Probe the SDF a few km offshore from the
-    //     projected coast point. If we're still in deep water there,
-    //     this is a real ocean coast — the foam fires. If the probe
-    //     hits land (or near-coast water), we're on a small body
-    //     (river, narrow strait, inland lake) and the foam is
-    //     suppressed. Art-side choice: foam is a coastline feature
-    //     for the big seas, not every inland water polygon.
     let coast_size_probe_uv =
-        world_to_world_uv(coast_point - coast_normal * FOAM_COAST_SIZE_PROBE_KM);
+        world_to_world_uv(coast_point - coast_normal * 6.0);
     let coast_size_dist = sample_water_dist_km(coast_size_probe_uv);
     let big_coast = smoothstep(-1.5, -4.0, coast_size_dist);
 
-    // 2. Static along-coast emission strength. Two octaves so we get
-    //    both broad "this region of coast emits a lot" patches and
-    //    finer per-spot variation — but neither pans with time.
-    //    Smoothstep range (0.35, 0.75) so quiet stretches stay quiet
-    //    — the surf needs to be along-coast variable, not a uniform
-    //    glow.
-    let emit_lo = vnoise(coast_point / FOAM_EMISSION_WL_KM);
-    let emit_hi = vnoise(coast_point / (FOAM_EMISSION_WL_KM * 0.35)
-                         + vec2<f32>(31.7, 17.3));
-    let emission = smoothstep(0.35, 0.75, emit_lo * 0.70 + emit_hi * 0.30);
-
-    // 3. Inward-propagating intensity wave with *gentle* per-coast
-    //    desync.
-    //    Two earlier desync mechanisms (a fine 1.2 km-wavelength
-    //    phase octave + ±15% period variation) produced visible
-    //    "blob" patches: adjacent stretches of coast could be near
-    //    half a cycle out of phase, so the wave never read as a
-    //    coherent inward sweep — you saw bright patches and dark
-    //    patches that didn't move together.
-    //    Now we use only a single low-frequency phase offset (~8 km
-    //    wavelength, amplitude 0.3 of a cycle) and a tiny ±4% period
-    //    drift. Adjacent metres of coast stay nearly in sync, so the
-    //    surf reads as one wave-front coming in everywhere together,
-    //    with just enough drift that a 2 min recording doesn't
-    //    obviously loop.
-    //    Constant-phase contours still move inward (toward the
-    //    coast) over time. The smooth cosine pulse avoids the
-    //    parallel-ridge artefacts a sharp `(1-phi)^K` pulse would
-    //    produce on curved coasts.
-    let offshore_km = max(0.0, -dist_km);
-    let foam_t = camera.i_time;
-    // Phase desync on a LONG wavelength (150 km) but with FULL
-    // amplitude (0.6 of a cycle). Within ~30 km of coast, phase
-    // varies by less than a fifth of a cycle — still visually
-    // coherent locally. Across ~150 km, phase can vary by the full
-    // range — so distant regions are genuinely at different points
-    // in their cycles. That's what stops every stretch of visible
-    // coast pulsing in lockstep without producing splotchy patches.
-    let phase_offset = vnoise(coast_point / 150.0) * 0.6;
-    let local_T = FOAM_PERIOD_S
-        * (0.97 + 0.06 * vnoise(coast_point / 250.0 + vec2<f32>(5.1, 8.4)));
-    let phase = (foam_t + offshore_km / FOAM_SPEED_KM_PER_S) / local_T
-                + phase_offset;
-    let phi = fract(phase);
-    // Duty-cycle pulse: bright in a narrow window of size
-    // FOAM_PULSE_DUTY around phi=0 (mod 1), zero everywhere else.
-    // `dist_to_peak` is the wrapped distance to the nearest phase=0
-    // point, so the pulse is symmetric on either side of the peak
-    // and there's no discontinuity at the cycle wrap.
-    let dist_to_peak = min(phi, 1.0 - phi);
-    let foam_brightness =
-        1.0 - smoothstep(0.0, FOAM_PULSE_DUTY * 0.5, dist_to_peak);
-
-    // 4. Spatial envelope: tent peaking at FOAM_PEAK_OFFSHORE_KM with
-    //    asymmetric falloff (sharper on the coast side, softer on the
-    //    seaward side). Foam intensity is 0 right at the waterline,
-    //    ramps up to peak a few hundred metres offshore, then fades
-    //    out further from shore. This is what gives the surf its
-    //    "line offset from the coast" look.
-    let inner_fade = smoothstep(
-        FOAM_PEAK_OFFSHORE_KM - FOAM_BAND_INNER_KM,
-        FOAM_PEAK_OFFSHORE_KM,
-        offshore_km,
-    );
-    let outer_fade = 1.0 - smoothstep(
-        FOAM_PEAK_OFFSHORE_KM,
-        FOAM_PEAK_OFFSHORE_KM + FOAM_BAND_OUTER_KM,
-        offshore_km,
-    );
-    let dissipation = inner_fade * outer_fade;
-
-    // Two-part blending so the surf integrates with the existing
-    // water artstyle instead of looking like white paint:
-    //   * Additive brightening with SEA_WATER_COLOR (the same colour
-    //     the wave-crest height-mod uses).
-    //   * A capped mix toward `foam_color` (a soft pale-blue, not
-    //     white) right where surf is strongest.
-    // Tuned so the foam reads clearly at regional zoom without
-    // becoming a hard white line.
-    let surf_signal = clamp(
-        emission * foam_brightness * dissipation * foam_modulator * big_coast,
-        0.0, 1.0,
-    );
-    water_color = water_color + SEA_WATER_COLOR * (surf_signal * 0.22);
-    water_color = mix(water_color, foam_color, clamp(surf_signal * 0.30, 0.0, 0.18));
-
-    // ---- Beaches: random sandy strips along non-cliff coast --------------
+    // ---- Beaches -------------------------------------------------------
     //
-    // Same "anchor noise at the projected coast point" trick foam uses.
-    // A given stretch of coast either gets a beach or doesn't, and the
-    // pattern doesn't drift when the camera pans.
-    //
-    // Gates (multiplied together):
-    //   * beach_proximity — inland band, max 300 m past the waterline.
-    //   * beach_seed      — two-octave noise sampled at coast_point.
-    //                       Some coasts get beaches; most don't.
-    //   * flat_gate       — no beaches on cliffs (slope from heightmap).
-    //   * big_coast       — already gates foam to real ocean coasts,
-    //                       not inland rivers/lakes. Reused here.
-    //   * beach_zoom_fade — only render when band is multiple pixels
-    //                       wide; avoids flicker-fringe on coasts at
-    //                       continent-scale zoom.
-    // Iter 2 tuning:
-    //   * Widened band 0.3 → 0.6 km — visible across more zoom levels.
-    //   * Lowered seed threshold so more coast gets beaches by default.
-    //   * Loosened zoom fade so beaches show at moderate zoom too.
-    //   * Bumped sand colour brighter so it pops against the lush green.
+    // Same gates as before; see the original land/water-combined shader
+    // for the full rationale. Sand mixed into the land colour wherever
+    // the gates align.
     let BEACH_BAND_KM: f32 = 0.6;
     let land_dist_km = max(0.0, dist_km);
     let beach_proximity = smoothstep(BEACH_BAND_KM, 0.0, land_dist_km);
@@ -1122,27 +852,128 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let sand = vec3<f32>(0.92, 0.84, 0.62);
     color = mix(color, sand, beach * 0.90);
 
-    color = mix(color, water_color, water_alpha);
-
-    // TEMPORARY: country/realm tinting disabled while iterating on
-    // map look. The realm_field texture binding is still present (the
-    // bind-group layout still requires it) — we just don't sample it.
-    // The realm_palette helper and hover-highlight branch are kept in
-    // source so re-enabling is a single block uncomment.
-    //
-    // let field_px_f = uv * REALM_FIELD_SIZE;
-    // let field_px   = clamp(vec2<i32>(field_px_f),
-    //                        vec2<i32>(0),
-    //                        vec2<i32>(i32(REALM_FIELD_SIZE) - 1));
-    // let field      = textureLoad(realm_field, field_px, 0);
-    // let realm_id   = u32(round(field.r));
-    // let field_a    = field.g;
-    // let realm_rgb  = realm_palette(realm_id);
-    // var tint_strength = field_a * 0.35;
-    // if (camera.hovered_pid != 0u && realm_id + 1u == camera.hovered_pid) {
-    //     tint_strength = field_a * 0.55;
-    // }
-    // color = mix(color, color * 0.55 + realm_rgb * 0.55, tint_strength);
-
+    // Solid land. The hard discard above means we never run on water
+    // fragments; coast AA will come back via a tighter mechanism in a
+    // follow-up iteration.
     return vec4<f32>(color, 1.0);
+}
+
+// Water plane fragment shader. All the TDM seascape + depth ramp +
+// foam logic that used to live in `fs_main` lives here now; opaque
+// everywhere (alpha=1), so the land pass on top drives the coast AA.
+@fragment
+fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
+    let uv = world_to_world_uv(in.world_xz);
+    let warped_uv = world_to_world_uv(warp_world_xz(in.world_xz));
+
+    let pixel_world_km = max(fwidth(in.world_xz.x), fwidth(in.world_xz.y));
+    let dist_km = sample_water_dist_km(warped_uv);
+
+    // ---- TDM Seascape shading ---------------------------------------
+    let coast_calm = smoothstep(-1.0, -6.0, dist_km);
+    let wave_str = wave_strength(pixel_world_km);
+    let wave_h_raw = wave_height(in.world_xz, pixel_world_km);
+    let wave_h = wave_h_raw * coast_calm;
+    let normal = wave_normal(in.world_xz, pixel_world_km, wave_str);
+
+    let cb_water = cam_basis();
+    let frag_pos = vec3<f32>(in.world_xz.x, 0.0, in.world_xz.y);
+    let view_dir = normalize(cb_water.eye - frag_pos);
+    let sun = normalize(WATER_SUN_DIR);
+
+    let fresnel_raw = clamp(1.0 - dot(normal, view_dir), 0.0, 1.0);
+    let fresnel = min(fresnel_raw * fresnel_raw * fresnel_raw, 0.5);
+    let reflected = sky_color(reflect(-view_dir, normal));
+    let refracted = SEA_BASE_COLOR
+                    + water_diffuse(normal, sun, 80.0) * SEA_WATER_COLOR * 0.12;
+
+    var water_color = mix(refracted, reflected, fresnel);
+    water_color = water_color
+                  + SEA_WATER_COLOR * (wave_h - SEA_HEIGHT_KM) * 0.04 * wave_str;
+    let spec = water_specular_tdm(normal, sun, view_dir, 50.0) * wave_str * 0.25;
+    water_color = water_color + vec3<f32>(spec);
+
+    // ---- Depth-driven colour ramp -----------------------------------
+    let offshore_km_for_color = max(0.0, -dist_km);
+    let bathy_m = sample_bathymetry_m(uv);
+    let shallow_c = vec3<f32>(0.42, 0.72, 0.70);
+    let mid_c     = vec3<f32>(0.24, 0.46, 0.58);
+    let deep_c    = vec3<f32>(0.06, 0.16, 0.34);
+    let t_low  = smoothstep(0.0, 5.0, offshore_km_for_color);
+    let t_high = smoothstep(200.0, 2500.0, bathy_m);
+    var depth_color = shallow_c;
+    depth_color = mix(depth_color, mid_c,  t_low);
+    depth_color = mix(depth_color, deep_c, t_high);
+    water_color = mix(water_color, depth_color, 0.75);
+
+    let foam_color = vec3<f32>(0.78, 0.86, 0.90);
+
+    // ---- SDF derivatives + coast geometry --------------------------
+    let eps_km = 2.0;
+    let d_xp = sample_water_dist_km(world_to_world_uv(in.world_xz + vec2<f32>( eps_km, 0.0)));
+    let d_xm = sample_water_dist_km(world_to_world_uv(in.world_xz + vec2<f32>(-eps_km, 0.0)));
+    let d_zp = sample_water_dist_km(world_to_world_uv(in.world_xz + vec2<f32>(0.0,  eps_km)));
+    let d_zm = sample_water_dist_km(world_to_world_uv(in.world_xz + vec2<f32>(0.0, -eps_km)));
+    let laplacian = (d_xp + d_xm + d_zp + d_zm - 4.0 * dist_km) / (eps_km * eps_km);
+    let grad_x = (d_xp - d_xm) / (2.0 * eps_km);
+    let grad_z = (d_zp - d_zm) / (2.0 * eps_km);
+    let grad_len = max(length(vec2<f32>(grad_x, grad_z)), 1e-6);
+    let coast_normal = vec2<f32>(grad_x, grad_z) / grad_len;
+    let curvature = clamp(abs(laplacian) * 5.0, 0.0, 1.0);
+    let foam_modulator =
+        (0.30 + 0.70 * curvature) * (0.5 + 0.5 * coast_ruggedness(in.world_xz));
+
+    // ---- Foam: anchored emission + propagating wave fronts ----------
+    let FOAM_PERIOD_S       = 50.0;
+    let FOAM_SPEED_KM_PER_S = 0.25;
+    let FOAM_PEAK_OFFSHORE_KM = 3.50;
+    let FOAM_BAND_INNER_KM    = 0.80;
+    let FOAM_BAND_OUTER_KM    = 1.20;
+    let FOAM_EMISSION_WL_KM   = 4.0;
+    let FOAM_PULSE_DUTY: f32 = 0.10;
+    let FOAM_COAST_SIZE_PROBE_KM: f32 = 6.0;
+
+    let coast_point = in.world_xz + (-dist_km) * coast_normal;
+    let coast_size_probe_uv =
+        world_to_world_uv(coast_point - coast_normal * FOAM_COAST_SIZE_PROBE_KM);
+    let coast_size_dist = sample_water_dist_km(coast_size_probe_uv);
+    let big_coast = smoothstep(-1.5, -4.0, coast_size_dist);
+
+    let emit_lo = vnoise(coast_point / FOAM_EMISSION_WL_KM);
+    let emit_hi = vnoise(coast_point / (FOAM_EMISSION_WL_KM * 0.35)
+                         + vec2<f32>(31.7, 17.3));
+    let emission = smoothstep(0.35, 0.75, emit_lo * 0.70 + emit_hi * 0.30);
+
+    let offshore_km = max(0.0, -dist_km);
+    let foam_t = camera.i_time;
+    let phase_offset = vnoise(coast_point / 150.0) * 0.6;
+    let local_T = FOAM_PERIOD_S
+        * (0.97 + 0.06 * vnoise(coast_point / 250.0 + vec2<f32>(5.1, 8.4)));
+    let phase = (foam_t + offshore_km / FOAM_SPEED_KM_PER_S) / local_T
+                + phase_offset;
+    let phi = fract(phase);
+    let dist_to_peak = min(phi, 1.0 - phi);
+    let foam_brightness =
+        1.0 - smoothstep(0.0, FOAM_PULSE_DUTY * 0.5, dist_to_peak);
+
+    let inner_fade = smoothstep(
+        FOAM_PEAK_OFFSHORE_KM - FOAM_BAND_INNER_KM,
+        FOAM_PEAK_OFFSHORE_KM,
+        offshore_km,
+    );
+    let outer_fade = 1.0 - smoothstep(
+        FOAM_PEAK_OFFSHORE_KM,
+        FOAM_PEAK_OFFSHORE_KM + FOAM_BAND_OUTER_KM,
+        offshore_km,
+    );
+    let dissipation = inner_fade * outer_fade;
+
+    let surf_signal = clamp(
+        emission * foam_brightness * dissipation * foam_modulator * big_coast,
+        0.0, 1.0,
+    );
+    water_color = water_color + SEA_WATER_COLOR * (surf_signal * 0.22);
+    water_color = mix(water_color, foam_color, clamp(surf_signal * 0.30, 0.0, 0.18));
+
+    return vec4<f32>(water_color, 1.0);
 }
