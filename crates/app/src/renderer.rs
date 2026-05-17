@@ -53,6 +53,14 @@ pub struct Renderer {
     /// gradients, and ring contours. See `script/gen-water-sdf`.
     water_sdf_tex: wgpu::Texture,
     water_sdf_view: wgpu::TextureView,
+    /// Bathymetry — real ocean depth in metres, R8Unorm over
+    /// [0, MAX_DEPTH_M]. Complements the SDF: the SDF drives the
+    /// near-coast aqua band (where the eye expects shallows), the
+    /// bathymetry drives the long offshore fade (where the SDF
+    /// saturates and depth-from-shore is no longer informative).
+    /// See `script/gen-bathymetry`.
+    bathymetry_tex: wgpu::Texture,
+    bathymetry_view: wgpu::TextureView,
     /// CPU copy of the binary water-mask bytes so the realm rasteriser
     /// can drop offshore cells. We keep loading `water_mask.png`
     /// solely for this; the bake shader has moved over to the SDF.
@@ -86,6 +94,14 @@ pub struct Renderer {
     depth_tex: wgpu::Texture,
     depth_view: wgpu::TextureView,
     depth_size: (u32, u32),
+
+    /// `performance.now()` value at renderer construction, in ms. Used
+    /// to derive a monotonic elapsed-seconds value for `i_time` on
+    /// every frame so the water shader's wave + foam animation
+    /// advances. Falling back to `Date::now()` if `performance` is
+    /// unavailable (shouldn't happen in any real browser, but keeps
+    /// the fallback path simple).
+    start_time_ms: f64,
 }
 
 impl Renderer {
@@ -123,6 +139,14 @@ impl Renderer {
         let (water_sdf_tex, water_sdf_view) =
             placeholder_texture(&gpu, "water_sdf (placeholder)",
                                 wgpu::TextureFormat::R8Unorm, &[128u8]);
+        // Placeholder bathymetry: byte=0 → 0 m depth (“surface / land”).
+        // Until the real PNG lands, the depth ramp acts as if the
+        // whole world is at sea level — the shader's near-coast aqua
+        // band still works off the SDF, and the offshore fade simply
+        // never kicks in. Harmless.
+        let (bathymetry_tex, bathymetry_view) =
+            placeholder_texture(&gpu, "bathymetry (placeholder)",
+                                wgpu::TextureFormat::R8Unorm, &[0u8]);
         let (biome_mask_tex, biome_mask_view) =
             placeholder_r8unorm(&gpu, "biome_mask (placeholder)");
 
@@ -171,6 +195,7 @@ impl Renderer {
             &sampler,
             &realm_field.view,
             &water_sdf_view,
+            &bathymetry_view,
             gpu.swapchain_format,
         );
 
@@ -203,6 +228,8 @@ impl Renderer {
             world_heightmap_view,
             water_sdf_tex,
             water_sdf_view,
+            bathymetry_tex,
+            bathymetry_view,
             water_mask_cpu: None,
             biome_mask_tex,
             biome_mask_view,
@@ -221,6 +248,7 @@ impl Renderer {
             depth_tex,
             depth_view,
             depth_size,
+            start_time_ms: now_ms(),
         }
     }
 
@@ -270,7 +298,10 @@ impl Renderer {
     }
 
     pub fn frame(&mut self) {
-        let uniforms = self.camera.to_uniforms(self.gpu.width, self.gpu.height);
+        let elapsed_s = ((now_ms() - self.start_time_ms) / 1000.0) as f32;
+        let uniforms =
+            self.camera
+                .to_uniforms(self.gpu.width, self.gpu.height, elapsed_s);
         self.gpu
             .queue
             .write_buffer(&self.camera_uniform_buf, 0, bytemuck::bytes_of(&uniforms));
@@ -361,6 +392,36 @@ impl Renderer {
         self.water_mask_cpu = Some((bytes.to_vec(), width, height));
         self.recompute_realm_infos();
         self.rebuild_realm_label_vertices();
+    }
+
+    /// Upload a fresh bathymetry texture (R8Unorm, depth-in-metres
+    /// over [0, MAX_DEPTH_M]). Consumed per-frame by `world_mesh` for
+    /// the long offshore portion of the depth-driven colour ramp.
+    /// See `script/gen-bathymetry` for the encoding.
+    pub fn set_bathymetry(&mut self, width: u32, height: u32, bytes: &[u8]) {
+        if (width, height) != (WORLD_TEX_SIZE, WORLD_TEX_SIZE) {
+            web_sys::console::warn_1(
+                &format!(
+                    "bathymetry size mismatch: got {width}x{height}, expected \
+                     {WORLD_TEX_SIZE}\u{00d7}{WORLD_TEX_SIZE}"
+                )
+                .into(),
+            );
+        }
+        let tex = upload_world_texture(
+            &self.gpu,
+            "bathymetry",
+            wgpu::TextureFormat::R8Unorm,
+            width,
+            height,
+            bytes,
+            1,
+        );
+        let view = tex.create_view(&Default::default());
+        self.bathymetry_tex = tex;
+        self.bathymetry_view = view;
+
+        self.rebuild_world_mesh_bind_group();
     }
 
     /// Upload a fresh water SDF and re-point the world_mesh pass at
@@ -469,6 +530,7 @@ impl Renderer {
             &self.sampler,
             &self.realm_field.view,
             &self.water_sdf_view,
+            &self.bathymetry_view,
         );
     }
 
@@ -643,6 +705,17 @@ fn upload_world_texture(
         },
     );
     tex
+}
+
+/// Monotonic high-resolution clock in milliseconds. Wraps
+/// `window.performance.now()` with a fall-through to `Date.now()` in
+/// the (extremely unlikely) absence of a `performance` global. Used
+/// to derive `i_time` for the water shader's animation.
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or_else(js_sys::Date::now)
 }
 
 /// Build a depth attachment sized to the current swapchain for the

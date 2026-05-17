@@ -31,9 +31,9 @@ use crate::ui::CityPanel;
 /// harness signal `window.__eu4_ready = true` is set so an external
 /// screenshot driver (see `script/screenshot`) can grab the canvas.
 ///
-/// Bumped from 3 → 4 when the SDF water field landed; we now wait on
-/// heightmap + water_mask + biome_mask + water_sdf before signalling.
-const SCREENSHOT_ASSET_COUNT: u32 = 4;
+/// Bumped 3 → 4 with the SDF, then 4 → 5 with the bathymetry texture
+/// (drives the long offshore depth fade in the water shader).
+const SCREENSHOT_ASSET_COUNT: u32 = 5;
 
 /// Apply query-string overrides for the initial camera position. Supported
 /// keys (all optional, all floats in world km / radians):
@@ -489,6 +489,15 @@ async fn run() {
         ready_remaining.clone(),
         "./water_sdf.png",
         |r, decoded| r.set_water_sdf(decoded.width, decoded.height, &decoded.bytes),
+    );
+    // Bathymetry — real ocean depth in metres, used by the water
+    // shader for the long offshore colour fade. Built offline by
+    // `script/gen-bathymetry` from the cached Mapzen terrarium tiles.
+    spawn_load(
+        renderer.clone(),
+        ready_remaining.clone(),
+        "./bathymetry.png",
+        |r, decoded| r.set_bathymetry(decoded.width, decoded.height, &decoded.bytes),
     );
 
     // cities.json — parsed into a LoadedSettlements (settlements +

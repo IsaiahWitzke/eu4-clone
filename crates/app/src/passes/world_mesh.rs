@@ -37,6 +37,7 @@ pub fn build(
     sampler: &wgpu::Sampler,
     realm_field_view: &wgpu::TextureView,
     water_sdf_view: &wgpu::TextureView,
+    bathymetry_view: &wgpu::TextureView,
     target_format: wgpu::TextureFormat,
 ) -> WorldMeshPass {
     let device = &gpu.device;
@@ -138,6 +139,19 @@ pub fn build(
                 },
                 count: None,
             },
+            // 9: bathymetry — real ocean depth in metres, R8Unorm over
+            //    [0, MAX_DEPTH_M]. Drives the long offshore colour fade
+            //    where the SDF saturates. See `script/gen-bathymetry`.
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     });
 
@@ -198,6 +212,7 @@ pub fn build(
         sampler,
         realm_field_view,
         water_sdf_view,
+        bathymetry_view,
     );
 
     WorldMeshPass {
@@ -220,6 +235,7 @@ pub fn make_bind_group(
     sampler: &wgpu::Sampler,
     realm_field_view: &wgpu::TextureView,
     water_sdf_view: &wgpu::TextureView,
+    bathymetry_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("world_mesh bg"),
@@ -260,6 +276,10 @@ pub fn make_bind_group(
             wgpu::BindGroupEntry {
                 binding: 8,
                 resource: wgpu::BindingResource::TextureView(water_sdf_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::TextureView(bathymetry_view),
             },
         ],
     })

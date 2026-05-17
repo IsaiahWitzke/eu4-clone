@@ -317,11 +317,15 @@ impl Camera {
         Some([mx, my])
     }
 
-    /// Build the GPU uniform block for the image pass.
-    pub fn to_uniforms(&self, width: u32, height: u32) -> CameraUniforms {
+    /// Build the GPU uniform block for the image pass. `time_s` is the
+    /// elapsed time in seconds since the renderer started, used by the
+    /// water shader to advance wave / foam animation. Caller is
+    /// responsible for sourcing the clock (typically
+    /// `performance.now() / 1000`).
+    pub fn to_uniforms(&self, width: u32, height: u32, time_s: f32) -> CameraUniforms {
         CameraUniforms {
             i_resolution: [width as f32, height as f32, 1.0],
-            i_time: 0.0,
+            i_time: time_s,
             world_center: self.world_center,
             hovered_pid: self.hovered_pid,
             hovered_city: self.hovered_city,

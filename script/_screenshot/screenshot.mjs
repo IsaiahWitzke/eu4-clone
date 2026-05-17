@@ -33,6 +33,10 @@ const { values } = parseArgs({
     output:    { type: "string", default: "screenshot.png" },
     url:       { type: "string", default: "http://127.0.0.1:8091/" },
     timeout:   { type: "string", default: "30" },
+    // Wait an additional N seconds after the renderer signals ready,
+    // before capturing the PNG. Useful for verifying water-shader
+    // animation: take two shots at different delays and diff them.
+    "delay-s": { type: "string", default: "0" },
     "keep-open": { type: "boolean", default: false },
   },
 });
@@ -123,6 +127,16 @@ try {
         requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
       ),
   );
+
+  // Optional extra delay so animated shaders (water waves, foam)
+  // have time to evolve past their t=0 starting state. The renderer's
+  // rAF loop keeps ticking the whole time the page is alive, so the
+  // shader's `i_time` will advance through `delay-s` seconds before
+  // the capture.
+  const delayS = Math.max(0, parseFloat(values["delay-s"]) || 0);
+  if (delayS > 0) {
+    await new Promise((r) => setTimeout(r, delayS * 1000));
+  }
 
   // Screenshot just the canvas, not the full viewport — that way the
   // city-panel overlay (when re-enabled) and any future HTML chrome

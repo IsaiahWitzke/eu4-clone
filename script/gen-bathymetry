@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""
+Generate `crates/app/assets/bathymetry.png` — a per-pixel ocean-depth map.
+
+Why this exists:
+  The SDF (`water_sdf.png`) encodes *distance from coast*, capped at
+  ±8 km. Beyond that band the value saturates, so any depth-driven
+  shader ramp built only from the SDF collapses to a thin glowing
+  fringe around every coast and uniform colour for the open ocean.
+
+  Mapzen's `terrarium` tiles (which we already cache for the
+  heightmap) include real bathymetry — negative elevations encode the
+  ocean floor below sea level. So we can read the same cached tiles a
+  second time and emit a complementary "depth in metres" texture that
+  drives the *long* offshore fade — North Sea stays shallow-teal,
+  open Atlantic / deep Med trenches go properly dark.
+
+Encoding:
+  * Input  : `crates/app/assets/tiles/z7/{x}_{y}.png` (Mapzen
+             terrarium). Same source as `gen-heightmap`.
+  * Output : `bathymetry.png` (R8, depth in metres mapped to
+             [0, 255] over [0, MAX_DEPTH_M]).
+  * Sign convention: byte = 0 means surface (sea level or land);
+    byte = 255 means at or past MAX_DEPTH_M below sea level.
+  * Range  : 0 m → MAX_DEPTH_M. Anything deeper is clamped. Land
+    pixels (positive elevation) collapse to byte=0 — the shader uses
+    the existing water mask / SDF to decide which fragments are
+    water in the first place, so the land bytes are never sampled
+    in a way that matters visually.
+
+Why R8 and not R16:
+  * R8 is filterable in every wgpu backend including the WebGL2
+    fallback (same path the heightmap, water mask, biome mask and
+    SDF use already).
+  * 6000 m / 256 ≈ 24 m/byte. Plenty for a smooth, slow water-colour
+    fade — the eye can't tell the difference between 1240 m and
+    1264 m of ocean depth through a tinted blue gloss.
+  * 4096² × 1 byte = 16 MB raw, ~3-4 MB after PNG compression. Same
+    cost as the SDF.
+
+Algorithm:
+  Mirrors `gen-heightmap` exactly up through the resample step, then
+  diverges:
+    1. Look up `tiles/z7/{x}_{y}.png` covering the bbox.
+    2. Decode terrarium RGB → elevation in metres.
+    3. Stitch into a single big float array.
+    4. Crop to the exact bbox.
+    5. Resample (Lanczos) to WORLD_TEX_SIZE².
+    6. Convert elevation → depth: `depth_m = max(0, -elev_m)`.
+    7. Quantise to R8 over [0, MAX_DEPTH_M].
+
+This script depends on `crates/app/assets/tiles/z7/` already being
+populated (run `script/download-heightmap-tiles` if it isn't).
+"""
+import math
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _world import ASSETS_DIR, WORLD_BBOX, WORLD_TEX_SIZE  # noqa: E402
+
+ZOOM = 7
+TILE_PX = 256
+TILE_DIR = ASSETS_DIR / "tiles" / f"z{ZOOM}"
+OUT_PNG = ASSETS_DIR / "bathymetry.png"
+
+# Mercator world half-extent (Web-Mercator definition).
+MERC_HALF = 20037508.342789244
+
+# Maximum depth represented in the texture, in metres. Mediterranean's
+# deepest point (Calypso Deep) is ~5267 m; deep Atlantic trenches in
+# the bbox sit around 5-6 km. 6000 m gives a clean round byte scale
+# (~24 m/byte) and saturates everything deeper to "full deep" — fine,
+# the shader can't tell 5800 m from 7000 m apart anyway.
+MAX_DEPTH_M = 6000.0
+
+
+def tile_range(zoom: int):
+    """Same logic as `gen-heightmap`; kept inline so the two scripts
+    don't get coupled through a shared mutable helper."""
+    n = 2 ** zoom
+    span = 2.0 * MERC_HALF
+    xmin, ymin, xmax, ymax = WORLD_BBOX
+
+    def merc_to_tx(x):
+        return int(math.floor((x + MERC_HALF) / span * n))
+
+    def merc_to_ty(y):
+        return int(math.floor((MERC_HALF - y) / span * n))
+
+    return (
+        max(0, merc_to_tx(xmin)),
+        min(n - 1, merc_to_tx(xmax)),
+        max(0, merc_to_ty(ymax)),
+        min(n - 1, merc_to_ty(ymin)),
+    )
+
+
+def main():
+    if not TILE_DIR.exists():
+        sys.exit(
+            f"missing {TILE_DIR}. Run `script/download-heightmap-tiles` first."
+        )
+
+    t0 = time.time()
+    x0, x1, y0, y1 = tile_range(ZOOM)
+    n_x = x1 - x0 + 1
+    n_y = y1 - y0 + 1
+    big_w = n_x * TILE_PX
+    big_h = n_y * TILE_PX
+    print(
+        f"Stitching tile grid x=[{x0}..{x1}] y=[{y0}..{y1}] "
+        f"\u2192 {big_w}\u00d7{big_h} float array"
+    )
+
+    elev = np.zeros((big_h, big_w), dtype=np.float32)
+    n_loaded = 0
+    for ty in range(y0, y1 + 1):
+        for tx in range(x0, x1 + 1):
+            tile_path = TILE_DIR / f"{tx}_{ty}.png"
+            if not tile_path.exists():
+                sys.exit(f"missing tile: {tile_path}")
+            arr = np.asarray(Image.open(tile_path).convert("RGB"))
+            if arr.shape != (TILE_PX, TILE_PX, 3):
+                sys.exit(f"unexpected tile shape {arr.shape} at {tile_path}")
+            r = arr[..., 0].astype(np.int32)
+            g = arr[..., 1].astype(np.int32)
+            b = arr[..., 2].astype(np.int32)
+            # Mapzen terrarium encoding:
+            #   elevation_m = (R * 256 + G + B / 256) - 32768
+            tile_elev = (r * 256 + g + b / 256.0) - 32768.0
+            px = (tx - x0) * TILE_PX
+            py = (ty - y0) * TILE_PX
+            elev[py:py + TILE_PX, px:px + TILE_PX] = tile_elev
+            n_loaded += 1
+    print(
+        f"  loaded {n_loaded} tiles, "
+        f"elevation range {elev.min():.1f} m \u2026 {elev.max():.1f} m"
+    )
+
+    # Crop to bbox (same math as gen-heightmap).
+    span = 2.0 * MERC_HALF
+    n = 2 ** ZOOM
+    m_per_px = span / (n * TILE_PX)
+    x_left = (x0 / n - 0.5) * span
+    y_top = (0.5 - y0 / n) * span
+    xmin, ymin, xmax, ymax = WORLD_BBOX
+    left = (xmin - x_left) / m_per_px
+    right = (xmax - x_left) / m_per_px
+    top = (y_top - ymax) / m_per_px
+    bottom = (y_top - ymin) / m_per_px
+    li, ri = int(round(left)), int(round(right))
+    ti, bi = int(round(top)), int(round(bottom))
+    print(
+        f"Cropping to bbox: stitched[{ti}:{bi}, {li}:{ri}] "
+        f"({bi - ti}\u00d7{ri - li} px, {m_per_px:.1f} m/px)"
+    )
+    cropped = elev[ti:bi, li:ri]
+
+    # Resample to WORLD_TEX_SIZE² using Lanczos. PIL's "F" mode handles
+    # 32-bit float arrays. Same recipe as gen-heightmap so the two
+    # textures are pixel-aligned.
+    print(f"Resampling to {WORLD_TEX_SIZE}\u00b2 (Lanczos)\u2026")
+    img_f = Image.fromarray(cropped, mode="F")
+    img_resized = img_f.resize(
+        (WORLD_TEX_SIZE, WORLD_TEX_SIZE), Image.LANCZOS
+    )
+    resampled = np.asarray(img_resized, dtype=np.float32)
+
+    # Convert elevation → ocean depth. Anything at or above sea level
+    # becomes 0; anything below becomes a positive depth in metres.
+    depth_m = np.maximum(0.0, -resampled)
+    print(
+        f"  depth range 0 \u2026 {depth_m.max():.1f} m, "
+        f"{(depth_m > 0).mean():.1%} water by area"
+    )
+
+    # Quantise to R8 over [0, MAX_DEPTH_M]. Anything deeper clamps to
+    # byte=255 (full deep). The shader treats byte=0 as "surface or
+    # land" — fine because land fragments don't sample this texture
+    # in a visible way (the water/land alpha gates it).
+    clamped = np.clip(depth_m, 0.0, MAX_DEPTH_M)
+    normalised = clamped / MAX_DEPTH_M
+    byte = np.round(normalised * 255.0).astype(np.uint8)
+
+    Image.fromarray(byte, mode="L").save(OUT_PNG, optimize=True)
+    size_kb = OUT_PNG.stat().st_size / 1024
+    print(f"  wrote {OUT_PNG} ({size_kb:.1f} KiB)")
+    print(f"done in {time.time() - t0:.1f}s")
+
+
+if __name__ == "__main__":
+    main()
